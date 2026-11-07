@@ -1,0 +1,302 @@
+import mongoose from "mongoose";
+const { Schema } = mongoose;
+const model = (name, fields, indexes = []) => {
+  const s = new Schema(fields, { timestamps: true });
+  for (const [keys, options] of indexes) s.index(keys, options);
+  return mongoose.model(name, s);
+};
+const ref = { type: Schema.Types.ObjectId, ref: "User" };
+export const User = model("User", {
+  name: String,
+  email: { type: String, unique: true, lowercase: true },
+  passwordHash: { type: String, select: false },
+  role: {
+    type: String,
+    enum: ["manager", "agent", "rep", "operator"],
+    default: "agent",
+  },
+  active: { type: Boolean, default: true },
+  availability: {
+    type: String,
+    enum: ["available", "away"],
+    default: "available",
+  },
+  awayUntil: Date,
+  capacity: { type: Number, default: 40 },
+  backup: ref,
+});
+export const Lead = model(
+  "Lead",
+  {
+    name: { type: String, required: true },
+    phone: { type: String, required: true, unique: true },
+    source: String,
+    owner: ref,
+    stage: {
+      type: String,
+      enum: [
+        "New",
+        "Contacting",
+        "Qualified",
+        "Demo/Meeting",
+        "Decision",
+        "Won",
+        "Lost",
+        "Nurture",
+      ],
+      default: "New",
+    },
+    ultra: { type: Boolean, default: false },
+    priorityReason: String,
+    workflowRevision: { type: Number, default: 0 },
+    doNotContact: { type: Boolean, default: false },
+    pauseUntil: Date,
+    location: String,
+    decisionMaker: String,
+    needs: String,
+    software: String,
+    timeframe: String,
+    objections: String,
+    notes: String,
+    closeReason: String,
+    lastContactAt: Date,
+    firstContactDueAt: Date,
+    firstAttemptAt: Date,
+    firstConnectedAt: Date,
+    agreementAccepted: Boolean,
+    advanceReceived: Boolean,
+    attribution: Schema.Types.Mixed,
+  },
+  [[{ owner: 1, stage: 1 }, {}]]
+);
+export const Task = model(
+  "Task",
+  {
+    lead: { type: Schema.Types.ObjectId, ref: "Lead" },
+    owner: ref,
+    title: String,
+    kind: String,
+    dueAt: Date,
+    originalDueAt: Date,
+    fixed: Boolean,
+    status: {
+      type: String,
+      enum: ["open", "done", "cancelled"],
+      default: "open",
+    },
+    key: { type: String, unique: true },
+    reason: String,
+    doneAt: Date,
+    snoozes: { type: Number, default: 0 },
+    customerFacing: Boolean,
+    demo: { type: Schema.Types.ObjectId, ref: "Demo" },
+    snoozeApprovalRequestedAt: Date,
+    pendingSnoozeAt: Date,
+    pendingSnoozeReason: String,
+    snoozeHistory: [
+      {
+        at: Date,
+        from: Date,
+        to: Date,
+        reason: String,
+        actor: ref,
+        approved: Boolean,
+      },
+    ],
+  },
+  [[{ owner: 1, status: 1, dueAt: 1 }, {}]]
+);
+export const Activity = model("Activity", {
+  lead: { type: Schema.Types.ObjectId, ref: "Lead" },
+  actor: ref,
+  type: String,
+  text: String,
+  data: Schema.Types.Mixed,
+});
+export const Call = model(
+  "Call",
+  {
+    clientId: { type: String, unique: true },
+    agent: ref,
+    lead: { type: Schema.Types.ObjectId, ref: "Lead" },
+    deviceId: String,
+    number: String,
+    direction: String,
+    startedAt: Date,
+    answeredAt: Date,
+    endedAt: Date,
+    activeMs: { type: Number, default: 0 },
+    preAnswerMs: Number,
+    localEndRequested: Boolean,
+    disconnectCode: Number,
+    endedBy: String,
+    events: [Schema.Types.Mixed],
+    outcome: String,
+    notes: String,
+    recordingKey: String,
+    recordingBytes: Number,
+    recordingStatus: { type: String, default: "missing" },
+    aiStatus: { type: String, default: "waiting" },
+    transcript: String,
+    ai: Schema.Types.Mixed,
+    aiError: String,
+    outcomeSaved: { type: Boolean, default: false },
+    outcomeSource: String,
+    technicalResult: String,
+    autoNextAt: Date,
+    meeting: { type: Schema.Types.ObjectId, ref: "Meeting" },
+  },
+  [[{ agent: 1, startedAt: -1 }, {}]]
+);
+export const Meeting = model("Meeting", {
+  sourceCall: {
+    type: Schema.Types.ObjectId,
+    ref: "Call",
+    unique: true,
+    sparse: true,
+  },
+  placePending: Boolean,
+  lead: { type: Schema.Types.ObjectId, ref: "Lead" },
+  reps: [ref],
+  start: Date,
+  end: Date,
+  travelMinutes: { type: Number, default: 0 },
+  type: String,
+  place: String,
+  confirmed: Boolean,
+  status: { type: String, default: "scheduled" },
+  outcome: String,
+});
+export const Demo = model("Demo", {
+  lead: { type: Schema.Types.ObjectId, ref: "Lead" },
+  owner: ref,
+  status: { type: String, default: "requested" },
+  token: { type: String, unique: true },
+  modules: String,
+  logoUrl: String,
+  shopName: String,
+  url: String,
+  sentAt: Date,
+  channel: String,
+  expiresAt: Date,
+  firstExploredAt: Date,
+  visits: { type: Number, default: 0 },
+  problem: String,
+  stageDueAt: Date,
+  stageStartedAt: Date,
+  stageRevision: { type: Number, default: 0 },
+  logoNote: String,
+  customerResponse: String,
+  responseNote: String,
+});
+export const Proposal = model("Proposal", {
+  lead: { type: Schema.Types.ObjectId, ref: "Lead" },
+  owner: ref,
+  version: Number,
+  amount: Number,
+  url: String,
+  status: { type: String, default: "draft" },
+  sentAt: Date,
+});
+export const Job = model("Job", {
+  key: { type: String, unique: true },
+  call: { type: Schema.Types.ObjectId, ref: "Call" },
+  status: { type: String, default: "pending" },
+  attempts: { type: Number, default: 0 },
+  nextAt: Date,
+  lockedAt: Date,
+  error: String,
+});
+export const Import = model("Import", {
+  source: { type: String, default: "meta" },
+  externalId: { type: String, unique: true },
+  status: String,
+  error: String,
+  payload: Schema.Types.Mixed,
+  lead: { type: Schema.Types.ObjectId, ref: "Lead" },
+  formId: String,
+  sourceCreatedAt: Date,
+  attempts: { type: Number, default: 0 },
+  nextAttemptAt: Date,
+});
+export const Setting = model("Setting", {
+  key: { type: String, unique: true },
+  value: Schema.Types.Mixed,
+});
+
+export const Notification = model(
+  "Notification",
+  {
+    key: { type: String, unique: true },
+    user: ref,
+    lead: { type: Schema.Types.ObjectId, ref: "Lead" },
+    task: { type: Schema.Types.ObjectId, ref: "Task" },
+    title: String,
+    body: String,
+    category: String,
+    severity: String,
+    dueAt: Date,
+    exception: { type: Schema.Types.ObjectId, ref: "Exception" },
+    acceptedAt: Date,
+    receivedAt: Date,
+    presentedAt: Date,
+    acknowledgedAt: Date,
+    resolvedAt: Date,
+    attempts: { type: Number, default: 0 },
+    nextAttemptAt: Date,
+    lockedUntil: Date,
+    leaseToken: String,
+    error: String,
+    receipts: [{ deviceId: String, at: Date, presented: Boolean }],
+  },
+  [[{ user: 1, resolvedAt: 1, createdAt: -1 }, {}]]
+);
+export const Device = model("Device", {
+  deviceId: { type: String, unique: true },
+  user: ref,
+  token: String,
+  enabled: Boolean,
+  lastSeenAt: Date,
+  disabledAt: Date,
+});
+export const Exception = model(
+  "Exception",
+  {
+    key: { type: String, unique: true },
+    type: String,
+    severity: String,
+    title: String,
+    detail: String,
+    lead: { type: Schema.Types.ObjectId, ref: "Lead" },
+    task: { type: Schema.Types.ObjectId, ref: "Task" },
+    owner: ref,
+    status: { type: String, default: "open" },
+    generation: { type: Number, default: 1 },
+    sourceImport: { type: Schema.Types.ObjectId, ref: "Import" },
+    lastSeenAt: Date,
+    resolvedAt: Date,
+  },
+  [[{ status: 1, lastSeenAt: -1 }, {}]]
+);
+export const Handover = model(
+  "Handover",
+  {
+    key: { type: String, unique: true },
+    lead: { type: Schema.Types.ObjectId, ref: "Lead" },
+    from: ref,
+    to: ref,
+    requestedBy: ref,
+    reason: String,
+    status: { type: String, default: "pending" },
+    expiresAt: Date,
+    acceptedAt: Date,
+    rejectedAt: Date,
+    rejectionReason: String,
+  },
+  [
+    [
+      { lead: 1, from: 1 },
+      { unique: true, partialFilterExpression: { status: "pending" } },
+    ],
+  ]
+);
