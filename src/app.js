@@ -30,6 +30,11 @@ import {
   Setting,
 } from "./models.js";
 import { phone, workSlot, nextStep, callMetrics, activeLead } from "./rules.js";
+import {
+  buildCallIntelligence,
+  buildEmployeeIntelligence,
+} from "./callInsights.js";
+import { deepTranscriptInsights } from "./transcriptAnalysis.js";
 import { task, log, sweep } from "./workflow.js";
 import { presign, completeUpload, playback } from "./storage.js";
 import { ingestMeta } from "./meta.js";
@@ -1092,13 +1097,15 @@ app.get(
     })
       .populate("lead", "name")
       .populate("owner", "name");
+    const intelligence = buildCallIntelligence(calls);
     s.json({
       period: { since, until },
       metrics: {
-        ...callMetrics(calls),
+        ...intelligence.metrics,
         outgoing: calls.filter((c) => c.direction === "outgoing").length,
         incoming: calls.filter((c) => c.direction === "incoming").length,
       },
+      callIntelligence: intelligence,
       employees: users.map((u) => ({
         id: u.id,
         name: u.name,
@@ -1116,6 +1123,7 @@ app.get(
           (c) => String(c.agent) === u.id && c.direction === "incoming"
         ).length,
         ...callMetrics(calls.filter((c) => String(c.agent) === u.id)),
+        callIntelligence: buildEmployeeIntelligence(calls, u.id),
       })),
       priority: leads.filter((l) => l.ultra && activeLead(l)),
       pipeline: leads.reduce(
@@ -1136,6 +1144,32 @@ app.get(
         {}
       ),
     });
+  })
+);
+app.post(
+  "/reports/coaching-brief",
+  manager,
+  wrap(async (q, s) => {
+    const since = new Date(
+      q.body.since || new Date(Date.now() - 30 * 86400000)
+    );
+    const until = new Date();
+    const calls = await Call.find({ startedAt: { $gte: since, $lte: until } });
+    const users = await User.find({ active: true });
+    s.json(await deepTranscriptInsights({ calls, users, since, until }));
+  })
+);
+app.post(
+  "/reports/deep-insights",
+  manager,
+  wrap(async (q, s) => {
+    const since = new Date(
+      q.body.since || new Date(Date.now() - 30 * 86400000)
+    );
+    const until = new Date();
+    const calls = await Call.find({ startedAt: { $gte: since, $lte: until } });
+    const users = await User.find({ active: true });
+    s.json(await deepTranscriptInsights({ calls, users, since, until }));
   })
 );
 app.get(
