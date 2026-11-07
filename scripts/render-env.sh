@@ -12,14 +12,15 @@ set -euo pipefail
 : "${GROQ_API_KEY:?required}"
 : "${SARVAM_API_KEY:?required}"
 
-render env set --service-id "$SERVICE_ID" --confirm \
-  MONGODB_URI="$MONGODB_URI" \
-  JWT_SECRET="$JWT_SECRET" \
-  PUBLIC_URL="$PUBLIC_URL" \
-  CORS_ORIGIN="$PUBLIC_URL" \
-  AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
-  AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
-  GROQ_API_KEY="$GROQ_API_KEY" \
-  SARVAM_API_KEY="$SARVAM_API_KEY"
-
-echo "Env updated. Trigger deploy from dashboard or: render deploys create \$SERVICE_ID"
+# Render CLI v2: set vars on create/update via dashboard or API.
+# Paste these in Dashboard → Service → Environment (or use services update when supported):
+printf '%s\n' \
+  "MONGODB_URI=$MONGODB_URI" \
+  "JWT_SECRET=$JWT_SECRET" \
+  "PUBLIC_URL=$PUBLIC_URL" \
+  "CORS_ORIGIN=$PUBLIC_URL" \
+  "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" \
+  "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" \
+  "GROQ_API_KEY=$GROQ_API_KEY" \
+  "SARVAM_API_KEY=$SARVAM_API_KEY"
+echo "Copy values above into Render → Environment, then Manual Deploy."
