@@ -35,6 +35,7 @@ import {
   buildEmployeeIntelligence,
 } from "./callInsights.js";
 import { deepTranscriptInsights } from "./transcriptAnalysis.js";
+import { localLeadOverview, synthesizeLeadOverview } from "./leadOverview.js";
 import { task, log, sweep } from "./workflow.js";
 import { presign, completeUpload, playback } from "./storage.js";
 import { ingestMeta } from "./meta.js";
@@ -388,10 +389,14 @@ app.get(
   "/leads/:id",
   wrap(async (q, s) => {
     const l = await leadFor(q, q.params.id);
+    const calls = await Call.find({ lead: l.id })
+      .sort({ startedAt: -1 })
+      .limit(100);
     s.json({
       lead: l,
       tasks: await Task.find({ lead: l.id }).sort({ dueAt: 1 }),
-      calls: await Call.find({ lead: l.id }).sort({ startedAt: -1 }).limit(100),
+      calls,
+      conversationOverview: localLeadOverview(calls),
       activities: await Activity.find({ lead: l.id })
         .sort({ createdAt: -1 })
         .limit(100),
@@ -399,6 +404,16 @@ app.get(
       proposals: await Proposal.find({ lead: l.id }),
       meetings: await Meeting.find({ lead: l.id }).populate("reps", "name"),
     });
+  })
+);
+app.get(
+  "/leads/:id/conversation-overview",
+  wrap(async (q, s) => {
+    const l = await leadFor(q, q.params.id);
+    const calls = await Call.find({ lead: l.id, aiStatus: "ready" }).sort({
+      startedAt: -1,
+    });
+    s.json(await synthesizeLeadOverview(calls));
   })
 );
 app.patch(
