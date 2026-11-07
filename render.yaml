@@ -3,7 +3,7 @@ services:
   - type: web
     name: swarna-grow-crm-api
     runtime: node
-    plan: starter
+    plan: free
     region: singapore
     repo: https://github.com/AadithGino/swarna-grow-crm-backend.git
     branch: main
