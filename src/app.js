@@ -1143,7 +1143,7 @@ app.get(
   manager,
   wrap(async (q, s) =>
     s.json({
-      s3: !!process.env.S3_BUCKET,
+      s3: !!(process.env.S3_BUCKET || process.env.AWS_S3_BUCKET),
       transcription: !!process.env.GROQ_API_KEY,
       summaries: !!process.env.SARVAM_API_KEY,
       meta: !!process.env.META_PAGE_TOKEN,

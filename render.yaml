@@ -1,0 +1,46 @@
+# Render Blueprint — connect repo in dashboard or: render blueprint apply
+services:
+  - type: web
+    name: swarna-grow-crm-api
+    runtime: node
+    plan: starter
+    region: singapore
+    repo: https://github.com/AadithGino/swarna-grow-crm-backend.git
+    branch: main
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: REQUIRE_PUSH
+        value: "false"
+      - key: AWS_REGION
+        value: ap-south-1
+      - key: S3_BUCKET
+        value: groquik-swarnagrow-media-prod
+      - key: AWS_S3_BUCKET
+        value: groquik-swarnagrow-media-prod
+      - key: AWS_S3_PREFIX
+        value: jewellers
+      - key: MAX_UPLOAD_BYTES
+        value: "10485760"
+      - key: LOG_LEVEL
+        value: info
+      - key: CORS_ORIGIN
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: SARVAM_API_KEY
+        sync: false

@@ -9,21 +9,31 @@ import { Job } from "./models.js";
 export const s3 = new S3Client({
   region: process.env.AWS_REGION || "ap-south-1",
 });
+const maxUploadBytes = () => {
+  const n = Number(process.env.MAX_UPLOAD_BYTES);
+  return Number.isFinite(n) && n > 0 ? n : 100 * 1024 * 1024;
+};
 const bucket = () => {
-  if (!process.env.S3_BUCKET)
-    throw Error("Configure S3_BUCKET before uploading");
-  return process.env.S3_BUCKET;
+  const name = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET;
+  if (!name) throw Error("Configure S3_BUCKET or AWS_S3_BUCKET before uploading");
+  return name;
+};
+const objectKey = (c) => {
+  const base = `calls/${c.agent}/${c.id}/original`;
+  const prefix = (process.env.AWS_S3_PREFIX || "").replace(/^\/+|\/+$/g, "");
+  return prefix ? `${prefix}/${base}` : base;
 };
 export async function presign(c, { bytes, contentType = "audio/ogg" }) {
-  if (!Number.isInteger(bytes) || bytes <= 0 || bytes > 100 * 1024 * 1024)
-    throw Error("Recording must be 1 byte–100 MB");
+  const cap = maxUploadBytes();
+  if (!Number.isInteger(bytes) || bytes <= 0 || bytes > cap)
+    throw Error(`Recording must be 1 byte–${cap} bytes`);
   if (
     !["audio/ogg", "audio/mpeg", "audio/mp4", "audio/wav"].includes(contentType)
   )
     throw Error("Unsupported audio type");
   if (c.recordingStatus === "uploaded")
     throw Error("A recording is already attached");
-  c.recordingKey = `calls/${c.agent}/${c.id}/original`;
+  c.recordingKey = objectKey(c);
   c.recordingBytes = bytes;
   c.recordingStatus = "uploading";
   await c.save();

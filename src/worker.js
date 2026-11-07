@@ -34,7 +34,7 @@ export async function processJob() {
     if (!c.transcript) {
       const obj = await s3.send(
         new GetObjectCommand({
-          Bucket: process.env.S3_BUCKET,
+          Bucket: process.env.S3_BUCKET || process.env.AWS_S3_BUCKET,
           Key: c.recordingKey,
         })
       );
