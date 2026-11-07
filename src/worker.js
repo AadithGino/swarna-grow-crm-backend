@@ -8,6 +8,23 @@ async function checked(r) {
     );
   return r.json();
 }
+function parseSummary(raw, finishReason) {
+  const text = String(raw || "").trim();
+  if (!text)
+    throw Error(
+      finishReason === "length"
+        ? "Summary model hit token limit with no output — retrying"
+        : "Summary model returned empty JSON"
+    );
+  const stripped = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+  try {
+    return JSON.parse(stripped);
+  } catch {
+    const match = stripped.match(/\{[\s\S]*\}/);
+    if (match) return JSON.parse(match[0]);
+    throw Error(`Summary JSON parse failed: ${stripped.slice(0, 120)}`);
+  }
+}
 export async function processJob() {
   const now = new Date();
   const j = await Job.findOneAndUpdate(
@@ -71,7 +88,7 @@ export async function processJob() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: "sarvam-105b",
+          model: "sarvam-105b-conversations",
           temperature: 0,
           messages: [
             {
@@ -91,8 +108,9 @@ export async function processJob() {
         signal: AbortSignal.timeout(120000),
       })
     );
-    const raw = r.choices?.[0]?.message?.content || "";
-    const ai = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, ""));
+    const choice = r.choices?.[0];
+    const raw = choice?.message?.content || "";
+    const ai = parseSummary(raw, choice?.finish_reason);
     if (typeof ai.summary !== "string" || !Array.isArray(ai.objections))
       throw Error("Invalid summary structure");
     c.ai = ai;
