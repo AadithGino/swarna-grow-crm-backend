@@ -230,7 +230,7 @@ test("legacy booking can instead become a real confirmation callback", async () 
   assert.equal(t.title, "Confirm meeting time");
   assert.equal(await Meeting.countDocuments({ sourceCall: c.id }), 0);
 });
-test("adding a link and confirming an appointment closes its corresponding tasks", async () => {
+test("saving a link keeps delivery open until explicitly sent", async () => {
   const l = await Lead.create({
     name: "Later link",
     phone: "+919876543215",
@@ -255,6 +255,10 @@ test("adding a link and confirming an appointment closes its corresponding tasks
   });
   assert.equal(update.status, 200);
   assert.equal(update.body.placePending, false);
+  assert.ok(await Task.exists({ key: `meeting-place:${m._id}`, status: "open" }));
+  const sent = await auth(request(app).patch("/meetings/" + m._id)).send({ placeSent: true });
+  assert.equal(sent.status, 200);
+
   assert.ok(
     await Task.exists({ key: `meeting-place:${m._id}`, status: "done" })
   );

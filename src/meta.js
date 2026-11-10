@@ -1,5 +1,5 @@
 import { Import, Lead, User, Setting } from "./models.js";
-import { phone, workSlot } from "./rules.js";
+import { phone } from "./rules.js";
 import { task } from "./workflow.js";
 import { initializeLead } from "./coverage.js";
 import { unavailable, policy, addWorkMinutes } from "./policy.js";
@@ -48,6 +48,10 @@ export async function ingestMeta(fetchGraph = graph, now = new Date()) {
           (d.field_data || []).map((x) => [x.name, x.values?.[0]])
         ),
         p = phone(fields.phone_number);
+      const sourceCreatedAt = new Date(d.created_time);
+      const enquiryAt = Number.isFinite(+sourceCreatedAt) && sourceCreatedAt <= now
+        ? sourceCreatedAt : now;
+      const dueAt = addWorkMinutes(enquiryAt, (await policy()).firstContactMinutes);
       const l = await Lead.findOneAndUpdate(
         { phone: p },
         {
@@ -56,19 +60,7 @@ export async function ingestMeta(fetchGraph = graph, now = new Date()) {
             phone: p,
             owner: owner.id,
             source: "Meta",
-            firstContactDueAt: addWorkMinutes(
-              new Date(
-                Math.min(
-                  +now,
-                  Number.isFinite(+new Date(d.created_time))
-                    ? +new Date(d.created_time)
-                    : +now
-                )
-              ),
-              (
-                await policy()
-              ).firstContactMinutes
-            ),
+            firstContactDueAt: dueAt,
             attribution: { adId: d.ad_id, formId: d.form_id, externalId: d.id },
           },
         },
@@ -78,16 +70,14 @@ export async function ingestMeta(fetchGraph = graph, now = new Date()) {
       if (!l.doNotContact && !["Won", "Lost"].includes(l.stage))
         await task(
           l,
-          ["Won", "Lost"].includes(l.stage)
-            ? "Review repeat enquiry from existing customer"
-            : "Contact Meta enquiry",
-          workSlot(now),
+          "Contact Meta enquiry",
+          dueAt,
           `meta:${d.id}`,
           { kind: "call", customerFacing: true }
         );
       item.lead = l.id;
       item.formId = d.form_id;
-      item.sourceCreatedAt = d.created_time;
+      item.sourceCreatedAt = enquiryAt;
       item.status =
         l.doNotContact || ["Won", "Lost"].includes(l.stage)
           ? "needs_review"

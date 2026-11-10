@@ -1,3 +1,8 @@
+import {
+  prepareSalesOutcome,
+  applySalesOutcome,
+  completeMeetingOutcome,
+} from "./salesOutcome.js";
 import operationsRoutes from "./operationsRoutes.js";
 import { initializeLead } from "./coverage.js";
 import { initializeDemo, advanceDemo } from "./demoFlow.js";
@@ -29,7 +34,7 @@ import {
   Import,
   Setting,
 } from "./models.js";
-import { phone, workSlot, nextStep, callMetrics, activeLead } from "./rules.js";
+import { phone, workSlot, callMetrics, activeLead } from "./rules.js";
 import {
   buildCallIntelligence,
   buildEmployeeIntelligence,
@@ -201,15 +206,15 @@ const manager = (q, s, next) =>
     ? next()
     : next(fail("Manager access required", 403));
 app.use(operationsRoutes);
-async function leadFor(q, leadId) {
+async function leadFor(q, leadId, { write = false } = {}) {
   if (!id(leadId)) throw fail("Invalid lead");
   const l = await Lead.findById(leadId);
   if (!l) throw fail("Lead not found", 404);
   if (
     q.user.role !== "manager" &&
     String(l.owner) !== q.user.id &&
-    !(await Task.exists({ lead: l.id, owner: q.user.id })) &&
-    !(await Meeting.exists({ lead: l.id, reps: q.user.id }))
+    !(await Task.exists({ lead: l.id, owner: q.user.id, ...(write ? { status: "open" } : {}) })) &&
+    !(await Meeting.exists({ lead: l.id, reps: q.user.id, ...(write ? { status: "scheduled" } : {}) }))
   )
     throw fail("Lead not assigned to you", 403);
   return l;
@@ -419,7 +424,7 @@ app.get(
 app.patch(
   "/leads/:id",
   wrap(async (q, s) => {
-    const l = await leadFor(q, q.params.id);
+    const l = await leadFor(q, q.params.id, { write: true });
     for (const k of [
       "name",
       "location",
@@ -463,7 +468,7 @@ app.patch(
         );
     }
     await l.save();
-    if (!activeLead(l)) {
+    if (l.doNotContact || ["Won", "Lost"].includes(l.stage)) {
       await Task.updateMany(
         { lead: l.id, status: "open" },
         { $set: { status: "cancelled" } }
@@ -472,7 +477,7 @@ app.patch(
         { lead: l.id, status: "scheduled" },
         { $set: { status: "cancelled" } }
       );
-    } else if (!(await Task.exists({ lead: l.id, status: "open" })))
+    } else if (activeLead(l) && !(await Task.exists({ lead: l.id, status: "open" })))
       await task(
         l,
         l.stage === "New" ? "First contact" : "Follow up",
@@ -589,6 +594,39 @@ app.get(
   )
 );
 
+app.get(
+  "/calls/client/:clientId",
+  wrap(async (q, s) => {
+    const c = await Call.findOne({
+      clientId: q.params.clientId,
+      agent: q.user.id,
+    }).populate("lead", "name phone");
+    if (!c) throw fail("Call is still syncing", 404);
+    s.json(c);
+  })
+);
+const pitchChecks = ["introduction", "qualification", "relevantPitch", "objectionHandling", "nextCommitment"];
+app.patch(
+  "/calls/:id/coaching-review",
+  manager,
+  wrap(async (q, s) => {
+    const call = await callFor(q, q.params.id);
+    if (!call.answeredAt) throw fail("Review connected calls only", 422);
+    const checks = Object.fromEntries(pitchChecks.map((key) => [key, q.body.checks?.[key]]));
+    if (Object.values(checks).some((value) =>
+      !["done", "missed", "not_applicable", "unassessable"].includes(value)))
+      throw fail("Rate each script step", 422);
+    const evidence = String(q.body.evidence || "").trim();
+    if (!evidence || evidence.length > 3000) throw fail("Add review evidence (up to 3000 characters)", 422);
+    call.coachingReview = {
+      rubric: "first-pitch-v1", checks, evidence,
+      objectionResult: String(q.body.objectionResult || "").slice(0, 300),
+      reviewer: q.user.id, reviewedAt: new Date(),
+    };
+    await call.save();
+    s.json(call.coachingReview);
+  })
+);
 app.post(
   "/calls/:id/outcome",
   wrap(async (q, s) => {
@@ -603,34 +641,8 @@ app.post(
     )
       return s.json(c);
     if (!c.lead) throw fail("Create or assign a lead first");
-    await leadFor(q, c.lead);
-    const outcomes = [
-      "no_answer",
-      "unreachable",
-      "busy",
-      "callback",
-      "interested",
-      "partner",
-      "meeting_booked",
-      "meeting_pending",
-      "not_now",
-      "not_interested",
-      "wrong_number",
-      "do_not_contact",
-    ];
-    if (!outcomes.includes(q.body.outcome)) throw fail("Choose an outcome");
-    const booking =
-      q.body.outcome === "meeting_booked"
-        ? await meetingInput(q.body.meeting)
-        : null;
-    if (booking) await ensureCalendarLocks(booking);
-    if (
-      ["not_interested", "wrong_number", "do_not_contact"].includes(
-        q.body.outcome
-      ) &&
-      !String(q.body.notes || "").trim()
-    )
-      throw fail("Record the reason before closing this lead.", 422);
+    await leadFor(q, c.lead, { write: true });
+    const prepared = await prepareSalesOutcome(q.body);
     const dbSession = await mongoose.startSession();
     let saved;
     try {
@@ -647,136 +659,23 @@ app.post(
           saved = call;
           return;
         }
-        const repairLegacy =
-          call.outcomeSaved &&
-          call.outcome === "meeting_booked" &&
-          !call.meeting;
         const l = await Lead.findById(call.lead).session(dbSession);
-        const attempts = await Call.countDocuments({
-          lead: l.id,
-          outcome: { $in: ["no_answer", "unreachable"] },
-          startedAt: { $gt: new Date(Date.now() - 7 * 86400000) },
-        }).session(dbSession);
-        const next = nextStep(q.body.outcome, {
-          at: q.body.nextAt,
-          attempts: attempts + 1,
+        if (!l) throw fail("Lead missing", 404);
+        await applySalesOutcome({
+          lead: l,
+          source: `outcome:${call.id}`,
+          actor: q.user,
+          session: dbSession,
+          prepared,
+          sourceCall: call,
         });
-        if (booking) {
-          const meeting = await bookMeeting(l, booking, dbSession, call._id);
-          call.meeting = meeting._id;
-          l.stage = "Demo/Meeting";
-          l.pauseUntil = booking.start;
-          await Task.updateMany(
-            { key: `outcome:${c.id}`, status: "open" },
-            { $set: { status: "cancelled" } },
-            { session: dbSession }
-          );
-        }
-        if (repairLegacy && next)
-          await Task.updateOne(
-            { key: `outcome:${c.id}` },
-            {
-              $set: {
-                title: next.title,
-                dueAt: next.dueAt,
-                kind: next.kind || "call",
-                fixed: !!next.fixed,
-                status: "open",
-              },
-            },
-            { session: dbSession }
-          );
-        if (next)
-          await Task.updateOne(
-            { key: `outcome:${c.id}` },
-            {
-              $setOnInsert: {
-                lead: l.id,
-                owner: l.owner,
-                title: q.body.nextTitle || next.title,
-                dueAt: next.dueAt,
-                originalDueAt: next.dueAt,
-                kind: next.kind || "call",
-                fixed: !!next.fixed,
-                reason: q.body.notes,
-              },
-            },
-            { upsert: true, session: dbSession }
-          );
-        if (q.body.outcome === "interested" && q.body.nextAt) {
-          const followAt = new Date(q.body.nextAt);
-          if (!Number.isFinite(+followAt) || followAt <= new Date())
-            throw fail("Choose a future follow-up time", 422);
-          await Task.updateOne(
-            { key: `details-follow:${c.id}` },
-            {
-              $setOnInsert: {
-                lead: l.id,
-                owner: l.owner,
-                title: "Follow up after sending details",
-                dueAt: followAt,
-                originalDueAt: followAt,
-                kind: "call",
-              },
-            },
-            { upsert: true, session: dbSession }
-          );
-        }
-        if (call.answeredAt) l.lastContactAt = call.answeredAt;
-        if (["callback", "not_now", "meeting_pending"].includes(q.body.outcome))
-          l.pauseUntil = new Date(q.body.nextAt);
-        if (["interested", "meeting_pending"].includes(q.body.outcome))
-          l.stage = "Qualified";
-        if (q.body.outcome === "not_now") l.stage = "Nurture";
-        if (
-          ["not_interested", "wrong_number", "do_not_contact"].includes(
-            q.body.outcome
-          )
-        ) {
-          l.stage = "Lost";
-          l.closeReason = q.body.outcome;
-          l.doNotContact = q.body.outcome === "do_not_contact";
-        }
-        await l.save({ session: dbSession });
-        // Complete only due call tasks. Future customer promises remain intact.
-        await Task.updateMany(
-          {
-            lead: l.id,
-            status: "open",
-            kind: { $in: ["call", "send_details", "confirm_meeting"] },
-            dueAt: { $lte: new Date() },
-            key: { $ne: `outcome:${c.id}` },
-          },
-          { $set: { status: "done", doneAt: new Date() } },
-          { session: dbSession }
-        );
-        if (!next && !booking) {
-          await Meeting.updateMany(
-            { lead: l.id, status: "scheduled" },
-            { $set: { status: "cancelled" } },
-            { session: dbSession }
-          );
-          await Task.updateMany(
-            { lead: l.id, status: "open" },
-            { $set: { status: "cancelled" } },
-            { session: dbSession }
-          );
-        }
-        await Activity.create(
-          [
-            {
-              lead: l.id,
-              actor: q.user.id,
-              type: "call_outcome",
-              text: q.body.notes || q.body.outcome,
-              data: { call: c.id, outcome: q.body.outcome },
-            },
-          ],
-          { session: dbSession }
-        );
         call.outcomeSource = "agent";
         call.outcomeSaved = true;
-        call.outcome = q.body.outcome;
+        call.outcome = prepared.b.outcome;
+        call.nextAction = prepared.b.nextAction;
+        call.actionNote = prepared.b.actionNote;
+        call.nextAt = prepared.b.nextAt;
+        call.channel = prepared.b.channel;
         call.notes = q.body.notes || "";
         await call.save({ session: dbSession });
         saved = call;
@@ -840,41 +739,38 @@ app.post(
 );
 app.get(
   "/meetings",
-  wrap(async (q, s) =>
-    s.json(
-      await Meeting.find(
-        q.user.role === "manager"
-          ? {}
-          : {
-              $or: [
-                { reps: q.user.id },
-                {
-                  lead: {
-                    $in: await Lead.find({ owner: q.user.id }).distinct("_id"),
-                  },
-                },
-              ],
-            }
-      )
-        .populate("lead", "name phone")
-        .populate("reps", "name")
-        .sort({ start: 1 })
-        .limit(300)
-    )
-  )
+  wrap(async (q, s) => {
+    const scope = q.user.role === "manager" ? {} : {
+      $or: [
+        { reps: q.user.id },
+        { lead: { $in: await Lead.find({ owner: q.user.id }).distinct("_id") } },
+      ],
+    };
+    const now = new Date();
+    const calendar = (filter) => Meeting.find({ ...scope, ...filter })
+      .populate("lead", "name phone")
+      .populate("reps", "name");
+    const [upcoming, history] = await Promise.all([
+      calendar({ status: "scheduled", end: { $gte: now } }).sort({ start: 1 }),
+      calendar({ $nor: [{ status: "scheduled", end: { $gte: now } }] })
+        .sort({ start: -1 }).limit(300),
+    ]);
+    s.json([...upcoming, ...history]);
+  })
 );
 
 app.post(
   "/meetings",
   wrap(async (q, s) => {
-    const l = await leadFor(q, q.body.lead),
+    const l = await leadFor(q, q.body.lead, { write: true }),
       b = await meetingInput(q.body);
     await ensureCalendarLocks(b);
     const session = await mongoose.startSession();
     let meeting;
     try {
       await session.withTransaction(async () => {
-        meeting = await bookMeeting(l, b, session);
+        const current = await Lead.findById(l.id).session(session);
+        meeting = await bookMeeting(current, b, session);
       });
     } finally {
       await session.endSession();
@@ -890,7 +786,9 @@ app.patch(
   wrap(async (q, s) => {
     const old = await Meeting.findById(q.params.id);
     if (!old) throw fail("Meeting not found", 404);
-    const lead = await leadFor(q, old.lead);
+    const lead = await leadFor(q, old.lead, { write: true });
+    if (q.body.salesOutcome)
+      return s.json(await completeMeetingOutcome(old.id, q.user, q.body));
     const b = q.body;
     const nextAction = selectedAction(b, "after_meeting");
     let place;
@@ -934,6 +832,9 @@ app.patch(
         if (place !== undefined) {
           m.place = place;
           m.placePending = false;
+        }
+        if (b.placeSent === true) {
+          if (m.placePending || !m.place) throw fail("Add the link or venue before marking it sent");
           await Task.updateOne(
             { key: `meeting-place:${m.id}`, status: "open" },
             { $set: { status: "done", doneAt: new Date() } },
@@ -941,6 +842,11 @@ app.patch(
           );
         }
         if (b.status) {
+          if (m.resultSaved || m.status !== "scheduled")
+            throw fail("This meeting is no longer scheduled", 409);
+          if (["completed", "no_show"].includes(b.status) && m.end > new Date())
+            throw fail("Log attendance after the meeting ends", 422);
+          m.resultSaved = true;
           m.status = b.status;
           m.outcome = b.outcome;
           await Task.updateMany(
@@ -1070,27 +976,46 @@ app.post(
 app.post(
   "/proposals/:id/sent",
   wrap(async (q, s) => {
-    const p = await Proposal.findById(q.params.id);
-    if (!p) throw fail("Not found", 404);
-    const l = await leadFor(q, p.lead);
-    if (!q.body.nextAt) throw fail("Decision conversation time required");
-    p.status = "sent";
-    p.sentAt = new Date();
-    await p.save();
-    await Task.updateOne(
-      { key: `proposal-send:${p.id}` },
-      { $set: { status: "done" } }
-    );
-    await task(
-      l,
-      "Discuss proposal decision",
-      q.body.nextAt,
-      `proposal-follow:${p.id}`,
-      { kind: "call" }
-    );
-    l.stage = "Decision";
-    await l.save();
-    s.json(p);
+    const old = await Proposal.findById(q.params.id);
+    if (!old) throw fail("Not found", 404);
+    await leadFor(q, old.lead);
+    const dueAt = new Date(q.body.nextAt);
+    if (!Number.isFinite(+dueAt) || dueAt <= new Date())
+      throw fail("Choose a future decision conversation time");
+    const session = await mongoose.startSession();
+    let proposal;
+    try {
+      await session.withTransaction(async () => {
+        proposal = await Proposal.findById(old.id).session(session);
+        const lead = await Lead.findById(proposal.lead).session(session);
+        if (lead.doNotContact || ["Won", "Lost"].includes(lead.stage))
+          throw fail("Reopen the lead before following up");
+        if (proposal.status === "sent" &&
+            await Task.exists({ key: `proposal-follow:${proposal.id}` }).session(session))
+          return;
+        const sentAt = proposal.sentAt || new Date();
+        await Task.updateOne(
+          { key: `proposal-follow:${proposal.id}` },
+          { $setOnInsert: {
+            lead: lead.id, owner: lead.owner, title: "Discuss proposal decision",
+            kind: "call", dueAt, originalDueAt: dueAt, customerFacing: true, fixed: true,
+          } },
+          { upsert: true, session }
+        );
+        await Task.updateOne(
+          { key: `proposal-send:${proposal.id}`, status: "open" },
+          { $set: { status: "done", doneAt: sentAt } }, { session }
+        );
+        proposal.status = "sent";
+        proposal.sentAt = sentAt;
+        lead.stage = "Decision";
+        await proposal.save({ session });
+        await lead.save({ session });
+      });
+    } finally {
+      await session.endSession();
+    }
+    s.json(proposal);
   })
 );
 app.get(
@@ -1128,6 +1053,7 @@ app.get(
         overdueCount: overdue.filter(
           (t) => String(t.owner?._id || t.owner) === u.id
         ).length,
+        callsReviewed: calls.filter((c) => String(c.agent) === u.id && c.coachingReview).length,
         meetingsBooked: calls.filter(
           (c) => String(c.agent) === u.id && !!c.meeting
         ).length,

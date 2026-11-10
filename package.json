@@ -1,6 +1,6 @@
 {
   "name": "swarna-crm-api",
-  "version": "1.3.0",
+  "version": "1.5.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,7 +8,7 @@
     "dev": "node src/supervisor.js",
     "seed": "node src/seed.js",
     "seed:demo": "node src/seed-demo.js",
-    "test": "node --test test/*.test.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
     "start:api": "node src/server.js",
     "start:sales": "node src/run-sales.js",
     "start:meta": "node src/run-meta.js",

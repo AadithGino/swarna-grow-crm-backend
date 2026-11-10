@@ -63,20 +63,29 @@ export async function sweep() {
           { kind: paused ? "internal" : "call" }
         );
     }
-    if (!(await Task.exists({ lead: l._id, status: "open" }))) {
+    if (!(await Task.exists({
+      lead: l._id, status: "open", customerFacing: { $ne: false },
+      kind: { $in: ["call", "confirmation", "confirm_meeting", "send_details", "send_proposal", "send_demo", "demo_response"] },
+    }))) {
       const upcoming = await Meeting.exists({
         lead: l._id,
         status: "scheduled",
         end: { $gte: now },
       });
-      if (!upcoming)
+      if (!upcoming) {
+        const base = `safety:${l.id}:${today}`;
+        const settled = await Task.countDocuments({
+          lead: l.id, key: { $regex: `^${base}(?::[0-9]+)?$` },
+          status: { $ne: "open" },
+        });
         await task(
           l,
           "Agree next action",
           workSlot(l.pauseUntil > now ? l.pauseUntil : now),
-          `safety:${l.id}:${today}`,
+          settled ? `${base}:${settled}` : base,
           { kind: "call", reason: "Active lead has no next action" }
         );
+      }
     }
   }
   for (const m of await Meeting.find({ status: "scheduled" }).populate(

@@ -7,7 +7,7 @@ export async function applyAutomaticOutcome(id) {
   try {
     await session.withTransaction(async () => {
       const c = await Call.findById(id).session(session);
-      if (!c || !c.lead) return;
+      if (!c) return;
       const facts = callFacts(c);
       // A later, more complete journal can supply ACTIVE after a provisional no-answer sync.
       if (c.outcomeSaved && c.outcomeSource === "events" && facts.connected) {
@@ -24,7 +24,21 @@ export async function applyAutomaticOutcome(id) {
         return;
       }
       if (c.outcomeSaved) return;
-      if (!facts.autoOutcome) return;
+      if (facts.technicalResult === "missed_incoming") {
+        const lead = c.lead && (await Lead.findById(c.lead).session(session));
+        if (!lead || lead.doNotContact || ["Won", "Lost"].includes(lead.stage)) return;
+        const dueAt = nextStep("no_answer").dueAt;
+        await Task.updateOne(
+          { key: `missed-incoming:${c.id}` },
+          { $setOnInsert: {
+            lead: lead.id, owner: lead.owner, title: "Return missed call",
+            kind: "call", dueAt, originalDueAt: dueAt, customerFacing: true,
+          } },
+          { upsert: true, session }
+        );
+        return;
+      }
+      if (!facts.autoOutcome || !c.lead) return;
       const lead = await Lead.findById(c.lead).session(session);
       if (!lead || !activeLead(lead)) return;
       // Serialize outcomes for one lead. Concurrent sync retries cannot duplicate a task.
@@ -39,12 +53,14 @@ export async function applyAutomaticOutcome(id) {
         outcome: { $in: ["no_answer", "unreachable"] },
         startedAt: { $gt: new Date(+now - 7 * 86400000) },
       }).session(session);
-      const next = nextStep("no_answer", { now, attempts: attempts + 1 });
+      const next = nextStep(facts.technicalResult === "line_busy" ? "busy" : "no_answer", { now, attempts: attempts + 1 });
       // Keep an existing customer promise, priority follow-up or booked appointment.
       const protectedTask = await Task.findOne({
         lead: lead.id,
         status: "open",
         fixed: true,
+        customerFacing: { $ne: false },
+        dueAt: { $gt: now },
       })
         .sort({ dueAt: 1 })
         .session(session);
@@ -83,17 +99,6 @@ export async function applyAutomaticOutcome(id) {
           c.autoNextAt = next.dueAt;
         }
       }
-      await Task.updateMany(
-        {
-          lead: lead.id,
-          status: "open",
-          kind: "call",
-          fixed: { $ne: true },
-          dueAt: { $lte: now },
-        },
-        { $set: { status: "done", doneAt: now } },
-        { session }
-      );
       c.outcome = "no_answer";
       c.outcomeSaved = true;
       c.outcomeSource = "events";

@@ -38,6 +38,7 @@ export function addWorkMinutes(at, minutes) {
 export const customerKinds = [
   "call",
   "send_details",
+  "send_proposal",
   "send_demo",
   "confirm_meeting",
   "confirmation",

@@ -443,6 +443,28 @@ export async function operationsSweep(now = new Date()) {
         now
       );
   }
+  for (const t of await Task.find({
+    key: /^meta:/, status: "open", dueAt: { $lte: now },
+  }).populate("lead", "name stage doNotContact")) {
+    if (!t.lead || t.lead.doNotContact || ["Won", "Lost"].includes(t.lead.stage)) continue;
+    const enquiry = await Import.findOne({ externalId: t.key.slice(5), status: "done" });
+    if (!enquiry?.sourceCreatedAt) continue;
+    const attempted = await Call.exists({
+      lead: t.lead.id,
+      $or: [
+        { direction: "outgoing", startedAt: { $gte: enquiry.sourceCreatedAt }, "events.type": "DIALING" },
+        { answeredAt: { $gte: enquiry.sourceCreatedAt } },
+      ],
+    });
+    if (!attempted) await issue(
+      `enquiry-contact:${enquiry.id}`,
+      "first_contact",
+      "Meta enquiry response overdue",
+      `${t.lead.name} has no logged contact attempt since this enquiry`,
+      { lead: t.lead.id, task: t.id, owner: t.owner, sourceImport: enquiry.id, severity: "critical" },
+      now
+    );
+  }
   const configured = !!process.env.META_PAGE_TOKEN;
   const meta = await Setting.findOne({ key: "metaCheck" });
   if (

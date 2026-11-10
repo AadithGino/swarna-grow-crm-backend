@@ -47,7 +47,7 @@ export function buildCallIntelligence(calls) {
 
   const talkTimes = answered.map((c) => (c.activeMs || 0) / 1000).sort((a, b) => a - b);
   const medianTalkSec = talkTimes.length
-    ? talkTimes[Math.floor(talkTimes.length / 2)]
+    ? (talkTimes[Math.floor((talkTimes.length - 1) / 2)] + talkTimes[Math.floor(talkTimes.length / 2)]) / 2
     : 0;
 
   const recordingRate = answered.length

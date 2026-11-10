@@ -125,7 +125,7 @@ test("invalid callback rolls back; concurrent outcome submissions create one nex
     request(app).post(`/calls/${c.id}/outcome`),
     agentToken
   ).send({ outcome: "callback" });
-  assert.equal(bad.status, 400);
+  assert.equal(bad.status, 422);
   assert.equal((await Call.findById(c.id)).outcomeSaved, false);
   let out = await Promise.all(
     [1, 2].map(() =>

@@ -75,9 +75,17 @@ export function nextStep(outcome, { at, now = new Date(), attempts = 0 } = {}) {
 export const activeLead = (l) =>
   !l.doNotContact && !["Won", "Lost", "Nurture"].includes(l.stage);
 export function callMetrics(calls) {
-  let connected = calls.filter((c) => c.answeredAt);
+  const connected = calls.filter((c) => c.answeredAt);
+  const outbound = calls.filter((c) => c.direction === "outgoing");
+  const inbound = calls.filter((c) => c.direction === "incoming");
+  const rate = (rows) => rows.length
+    ? Math.round(100 * rows.filter((c) => c.answeredAt).length / rows.length)
+    : 0;
   return {
     attempts: calls.length,
+    outboundPickupRate: rate(outbound),
+    inboundAnswerRate: rate(inbound),
+    uniqueLeadsReached: new Set(connected.filter((c) => c.lead).map((c) => String(c.lead))).size,
     connected: connected.length,
     pickupRate: calls.length
       ? Math.round((connected.length / calls.length) * 100)

@@ -32,6 +32,9 @@ test("calls count answered conversations separately and preserve unknown endings
     ]),
     {
       attempts: 3,
+      outboundPickupRate: 0,
+      inboundAnswerRate: 0,
+      uniqueLeadsReached: 0,
       connected: 2,
       pickupRate: 67,
       averageConnectedSeconds: 30,

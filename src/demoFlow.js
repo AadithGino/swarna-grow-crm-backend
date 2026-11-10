@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import mongoose from "mongoose";
 import { Demo, Lead, Task, Activity } from "./models.js";
 import { policy, addWorkMinutes } from "./policy.js";
@@ -29,6 +30,20 @@ export async function demoStage(d, p, now = new Date()) {
     problem: ["Resolve demo issue", "technical", 120],
   };
   return config[d.status] || null;
+}
+export async function requestDemoFromOutcome(lead, outcome, session, now) {
+  const [demo] = await Demo.create([{
+    lead: lead.id,
+    owner: outcome.nextOwner || lead.owner,
+    shopName: lead.name,
+    modules: outcome.actionNote,
+    token: randomBytes(24).toString("hex"),
+    expiresAt: new Date(+now + 14 * 86400000),
+    stageStartedAt: now,
+    stageDueAt: outcome.nextAt,
+  }], { session });
+  await stageTask(demo, ["Request customer logo", "call"], session, demo.owner);
+  return demo;
 }
 export async function initializeDemo(id, now = new Date()) {
   const p = await policy(),
@@ -72,7 +87,7 @@ export async function initializeDemo(id, now = new Date()) {
   }
   return result;
 }
-async function stageTask(d, stage, session) {
+async function stageTask(d, stage, session, assignedOwner) {
   const l = await Lead.findById(d.lead).session(session || null);
   if (!l) return;
   await Task.updateOne(
@@ -82,7 +97,7 @@ async function stageTask(d, stage, session) {
         lead: d.lead,
         demo: d.id,
         owner: ["call", "send_demo", "demo_response"].includes(stage[1])
-          ? l.owner
+          ? assignedOwner || l.owner
           : d.owner,
         title: stage[0],
         kind: stage[1],
@@ -133,6 +148,8 @@ export async function advanceDemo(
     )
   )
     throw fail("Select the actual customer response");
+  if (target === "responded" && b.customerResponse === "not_now" && !b.nextAt)
+    throw fail("Choose when the customer wants to hear from you");
   if (target === "problem" && !b.problem?.trim() && !old.problem)
     throw fail("Describe the demo issue");
   const p = await policy(),
@@ -185,9 +202,16 @@ export async function advanceDemo(
               $setOnInsert: {
                 lead: d.lead,
                 owner: l.owner,
-                title: "Follow up on demo response",
-                kind: "call",
-                customerFacing: true,
+                title: {
+                  interested: "Agree a demo walkthrough time",
+                  questions: "Answer customer’s demo questions",
+                  not_now: "Call back about demo at agreed time",
+                  not_interested: "Review demo decline and decide whether to close",
+                }[b.customerResponse],
+                kind: b.customerResponse === "interested" ? "confirm_meeting"
+                  : b.customerResponse === "not_interested" ? "internal" : "call",
+                customerFacing: b.customerResponse !== "not_interested",
+                fixed: b.customerResponse === "not_now",
                 dueAt: due,
                 originalDueAt: due,
               },

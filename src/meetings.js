@@ -103,6 +103,8 @@ async function insertTask(
   );
 }
 export async function bookMeeting(lead, b, session, sourceCall) {
+  if (lead.doNotContact || ["Won", "Lost"].includes(lead.stage))
+    throw reject("Reopen the lead before booking a meeting.");
   for (const rep of [...b.reps].sort())
     await Setting.updateOne(
       { key: `calendar:${rep}` },
@@ -137,11 +139,6 @@ export async function bookMeeting(lead, b, session, sourceCall) {
   await Lead.updateOne(
     { _id: lead._id },
     { $set: { stage: "Demo/Meeting", pauseUntil: b.start } },
-    { session }
-  );
-  await Task.updateMany(
-    { lead: lead._id, status: "open", kind: "call", fixed: { $ne: true } },
-    { $set: { status: "cancelled" } },
     { session }
   );
   const now = new Date(),
