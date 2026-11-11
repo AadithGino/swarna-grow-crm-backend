@@ -395,7 +395,7 @@ export async function operationsSweep(now = new Date()) {
         `${lead.name}: ${d.status} deadline passed`,
         {
           lead: lead.id,
-          owner: [
+          owner: d.selfServe ? d.owner : [
             "requested",
             "logo_requested",
             "ready",

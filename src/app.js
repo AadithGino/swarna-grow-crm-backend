@@ -1,3 +1,5 @@
+import { pitchSteps, pitchVersion } from "./pitchRubric.js";
+import { managerMonitoring } from "./managerMonitoring.js";
 import {
   prepareSalesOutcome,
   applySalesOutcome,
@@ -297,12 +299,19 @@ app.get(
         ],
       };
     }
-    s.json(
-      await Lead.find(filter)
-        .populate("owner", "name")
-        .sort({ ultra: -1, updatedAt: -1 })
-        .limit(500)
-    );
+    const leads = await Lead.find(filter)
+      .populate("owner", "name")
+      .sort({ ultra: -1, updatedAt: -1 })
+      .limit(500)
+      .lean();
+    const tasks = await Task.find({ lead: { $in: leads.map(lead => lead._id) }, status: "open" })
+      .select("lead title dueAt")
+      .sort({ dueAt: 1 })
+      .lean();
+    const nextByLead = new Map();
+    for (const task of tasks)
+      if (!nextByLead.has(String(task.lead))) nextByLead.set(String(task.lead), task);
+    s.json(leads.map(lead => ({ ...lead, nextTask: nextByLead.get(String(lead._id)) })));
   })
 );
 app.post(
@@ -605,21 +614,35 @@ app.get(
     s.json(c);
   })
 );
-const pitchChecks = ["introduction", "qualification", "relevantPitch", "objectionHandling", "nextCommitment"];
+app.get(
+  "/calls/:id",
+  wrap(async (q, s) => {
+    const call = await callFor(q, q.params.id);
+    await call.populate("lead", "name phone");
+    s.json(call);
+  })
+);
+app.get("/reports/pitch-rubric", manager, (q, s) => s.json({ version: pitchVersion, steps: pitchSteps }));
+const legacyPitchChecks = ["introduction", "qualification", "relevantPitch", "objectionHandling", "nextCommitment"];
 app.patch(
   "/calls/:id/coaching-review",
   manager,
   wrap(async (q, s) => {
     const call = await callFor(q, q.params.id);
     if (!call.answeredAt) throw fail("Review connected calls only", 422);
+    const newRubric = q.body.rubric === pitchVersion;
+    const pitchChecks = newRubric ? pitchSteps.map(([key]) => key) : legacyPitchChecks;
+    if (newRubric && !["in_order", "out_of_order", "unassessable"].includes(q.body.order))
+      throw fail("Rate the sequence of the pitch", 422);
     const checks = Object.fromEntries(pitchChecks.map((key) => [key, q.body.checks?.[key]]));
     if (Object.values(checks).some((value) =>
-      !["done", "missed", "not_applicable", "unassessable"].includes(value)))
+      !["done", "partial", "missed", "not_applicable", "unassessable"].includes(value)))
       throw fail("Rate each script step", 422);
     const evidence = String(q.body.evidence || "").trim();
     if (!evidence || evidence.length > 3000) throw fail("Add review evidence (up to 3000 characters)", 422);
     call.coachingReview = {
-      rubric: "first-pitch-v1", checks, evidence,
+      rubric: newRubric ? pitchVersion : "first-pitch-v1", checks, evidence,
+      ...(newRubric ? { order: q.body.order } : {}),
       objectionResult: String(q.body.objectionResult || "").slice(0, 300),
       reviewer: q.user.id, reviewedAt: new Date(),
     };
@@ -906,6 +929,10 @@ app.patch(
     s.json(result);
   })
 );
+app.get("/demo-generator", (q, s) => {
+  const url = process.env.DEMO_GENERATOR_URL || "";
+  s.json({ url: /^https?:\/\//i.test(url) ? url : null });
+});
 app.get(
   "/demos",
   wrap(async (q, s) =>
@@ -924,11 +951,19 @@ app.get(
 app.post(
   "/demos",
   wrap(async (q, s) => {
-    const l = await leadFor(q, q.body.lead);
+    const l = await leadFor(q, q.body.lead, { write: true });
+    const shopName = String(q.body.shopName ?? l.name).trim();
+    if (!shopName) throw fail("Enter the shop name", 422);
+    const logoUrl = String(q.body.logoUrl || "").trim();
+    const logoNote = String(q.body.logoNote || "").trim();
     const d = await Demo.create({
       lead: l.id,
-      shopName: l.name,
-      owner: id(q.body.owner) ? q.body.owner : l.owner,
+      shopName,
+      selfServe: true,
+      logoUrl,
+      logoNote,
+      status: logoUrl || logoNote ? "logo_received" : "requested",
+      owner: q.user.role === "manager" && id(q.body.owner) ? q.body.owner : q.user.id,
       modules: q.body.modules || l.needs,
       token: crypto.randomBytes(24).toString("hex"),
       expiresAt: new Date(Date.now() + 14 * 86400000),
@@ -942,7 +977,7 @@ app.patch(
   wrap(async (q, s) => {
     const d = await Demo.findById(q.params.id);
     if (!d) throw fail("Demo not found", 404);
-    await leadFor(q, d.lead);
+    await leadFor(q, d.lead, { write: true });
     const updated = await advanceDemo(d.id, q.body, q.user.id);
     s.json({
       ...updated.toObject(),
@@ -1038,7 +1073,9 @@ app.get(
       .populate("lead", "name")
       .populate("owner", "name");
     const intelligence = buildCallIntelligence(calls);
+    const monitoring = await managerMonitoring(since, until, overdue, leads);
     s.json({
+      attention: monitoring.attention,
       period: { since, until },
       metrics: {
         ...intelligence.metrics,
@@ -1050,9 +1087,18 @@ app.get(
         id: u.id,
         name: u.name,
         role: u.role,
+        monitoring: monitoring.byEmployee.get(u.id) || {},
         overdueCount: overdue.filter(
           (t) => String(t.owner?._id || t.owner) === u.id
         ).length,
+        callRecords: calls.filter(c => String(c.agent) === u.id).map(c => ({
+          _id: c.id, lead: c.lead, number: c.number, direction: c.direction,
+          startedAt: c.startedAt, answeredAt: c.answeredAt, activeMs: c.activeMs,
+          recordingStatus: c.recordingStatus,
+          ai: c.ai?.scriptAssessment ? { scriptAssessment: c.ai.scriptAssessment } : undefined,
+          coachingReview: c.coachingReview,
+        })),
+        assessedCalls: calls.filter((c) => String(c.agent) === u.id && c.ai?.scriptAssessment).length,
         callsReviewed: calls.filter((c) => String(c.agent) === u.id && c.coachingReview).length,
         meetingsBooked: calls.filter(
           (c) => String(c.agent) === u.id && !!c.meeting

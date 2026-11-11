@@ -397,7 +397,7 @@ test("fixed customer promise cannot be rescheduled without reconfirmation", asyn
   );
   assert.equal(+(await Task.findById(t.id)).dueAt, +t.dueAt);
 });
-test("demo stages have accountable deadlines and cannot jump logo preparation or fake sharing", async () => {
+test("demo stages have accountable deadlines and require a logo and prevent fake sharing", async () => {
   const d = await Demo.create({
     lead: lead.id,
     owner: backup.id,
@@ -413,7 +413,7 @@ test("demo stages have accountable deadlines and cannot jump logo preparation or
         { status: "ready", url: "https://example.com" },
         agent.id
       ),
-    /previous/
+    /logo/
   );
   await advanceDemo(
     d.id,
@@ -768,4 +768,39 @@ test("stage-aware demo creates one share task and cannot be falsely completed ma
       }),
     /Demo handovers/
   );
+});
+
+test("telesales can save a generated demo and managers see its share activity", async () => {
+  const created = await auth(request(app).post("/demos")).send({ lead: lead.id, shopName: "Demo Jewellers" });
+  assert.equal(created.status, 201);
+  const id = created.body._id;
+  const ready = await auth(request(app).patch("/demos/" + id)).send({
+    status: "ready", logoNote: "Logo in enquiry chat", url: "https://example.com/demo",
+  });
+  assert.equal(ready.status, 200);
+  assert.ok(await Task.exists({ demo: id, owner: agent.id, kind: "send_demo", status: "open" }));
+  const sent = await auth(request(app).patch("/demos/" + id)).send({
+    status: "sent", confirmSent: true, channel: "WhatsApp",
+  });
+  assert.equal(sent.status, 200);
+  const report = await auth(request(app).get("/reports"), manager);
+  assert.equal(report.status, 200);
+  assert.equal(report.body.employees.find(row => row.id === agent.id).monitoring.demosSent[0]._id, id);
+});
+
+test("manager queue and on-time counts use outstanding work and original deadlines", async () => {
+  const deadline = new Date(Date.now() - 60000);
+  await Task.create([
+    { lead: lead.id, owner: agent.id, key: "queue-callback", kind: "call",
+      title: "Return missed call", dueAt: deadline, originalDueAt: deadline },
+    { lead: lead.id, owner: agent.id, key: "on-time-callback", kind: "call",
+      title: "Promised callback", dueAt: future(), originalDueAt: deadline,
+      status: "done", doneAt: deadline },
+  ]);
+  const report = await auth(request(app).get("/reports"), manager);
+  assert.equal(report.status, 200);
+  assert.ok(report.body.attention.some(row => row.title === "Return missed call"));
+  const staff = report.body.employees.find(row => row.id === agent.id);
+  assert.equal(staff.monitoring.followUpsDue.length, 2);
+  assert.equal(staff.monitoring.followUpsOnTime.length, 1);
 });

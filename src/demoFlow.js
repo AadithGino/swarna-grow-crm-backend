@@ -4,9 +4,9 @@ import { Demo, Lead, Task, Activity } from "./models.js";
 import { policy, addWorkMinutes } from "./policy.js";
 const fail = (m) => Object.assign(Error(m), { status: 422 });
 const transitions = {
-  requested: ["logo_requested", "logo_received", "preparing", "problem"],
-  logo_requested: ["logo_received", "problem"],
-  logo_received: ["preparing", "problem"],
+  requested: ["ready", "logo_requested", "logo_received", "preparing", "problem"],
+  logo_requested: ["ready", "logo_received", "problem"],
+  logo_received: ["ready", "preparing", "problem"],
   preparing: ["ready", "problem"],
   ready: ["sent", "problem", "preparing"],
   sent: ["explored", "responded", "problem"],
@@ -18,15 +18,15 @@ export async function demoStage(d, p, now = new Date()) {
   const config = {
     requested: ["Request customer logo", "call", p.logoMinutes],
     logo_requested: ["Collect customer logo", "call", p.logoMinutes],
-    logo_received: ["Start personalised demo", "demo_build", p.prepareMinutes],
-    preparing: ["Finish personalised demo", "demo_build", p.prepareMinutes],
-    ready: ["Share ready demo", "send_demo", p.shareMinutes],
+    logo_received: ["Generate demo with shop name and logo", "demo_build", d.selfServe ? 15 : p.prepareMinutes],
+    preparing: ["Finish generating demo", "demo_build", p.prepareMinutes],
+    ready: ["Share ready demo", "send_demo", d.selfServe ? 15 : p.shareMinutes],
     sent: [
       "Check demo received and customer response",
       "demo_response",
-      p.responseMinutes,
+      d.selfServe ? 120 : p.responseMinutes,
     ],
-    explored: ["Ask for customer feedback", "demo_response", p.responseMinutes],
+    explored: ["Ask for customer feedback", "demo_response", d.selfServe ? 120 : p.responseMinutes],
     problem: ["Resolve demo issue", "technical", 120],
   };
   return config[d.status] || null;
@@ -36,6 +36,7 @@ export async function requestDemoFromOutcome(lead, outcome, session, now) {
     lead: lead.id,
     owner: outcome.nextOwner || lead.owner,
     shopName: lead.name,
+    selfServe: true,
     modules: outcome.actionNote,
     token: randomBytes(24).toString("hex"),
     expiresAt: new Date(+now + 14 * 86400000),
@@ -96,7 +97,7 @@ async function stageTask(d, stage, session, assignedOwner) {
       $setOnInsert: {
         lead: d.lead,
         demo: d.id,
-        owner: ["call", "send_demo", "demo_response"].includes(stage[1])
+        owner: d.selfServe ? d.owner : ["call", "send_demo", "demo_response"].includes(stage[1])
           ? assignedOwner || l.owner
           : d.owner,
         title: stage[0],
@@ -127,6 +128,8 @@ export async function advanceDemo(
     throw fail("Complete the previous demo stage first");
   if (target === "explored" && !trustedEntry)
     throw fail("Demo entry is recorded by the customer link");
+  const shopName = String(b.shopName ?? old.shopName ?? "").trim() ||
+    (!b.shopName && (await Lead.findById(old.lead).select("name"))?.name) || "";
   const logo = b.logoUrl || old.logoUrl,
     logoNote = b.logoNote || old.logoNote;
   if (
@@ -137,6 +140,8 @@ export async function advanceDemo(
     throw fail("Add the logo URL or note where the received logo is stored");
   let url = b.url || old.url;
   if (url && !/^https?:\/\//i.test(url)) throw fail("Enter a full demo URL");
+  if (target === "ready" && !old.url && (!shopName || (!logo && !logoNote?.trim())))
+    throw fail("Enter the shop name and add its logo");
   if (target === "ready" && !url)
     throw fail("Add a working personalised demo URL");
   if (target === "sent" && (!b.confirmSent || !b.channel))
@@ -162,6 +167,7 @@ export async function advanceDemo(
         throw Object.assign(Error("Demo changed. Refresh before updating"), {
           status: 409,
         });
+      d.shopName = shopName;
       d.url = url;
       d.logoUrl = logo;
       d.logoNote = logoNote;
@@ -170,7 +176,12 @@ export async function advanceDemo(
         d.stageRevision = (d.stageRevision || 0) + 1;
         d.stageStartedAt = now;
         const stage = await demoStage(d, p, now);
+        const previousDeadline = d.stageDueAt;
         d.stageDueAt = stage ? addWorkMinutes(now, stage[2]) : undefined;
+        if (d.selfServe && ["preparing", "ready"].includes(target) && ["logo_received", "preparing"].includes(old.status) && previousDeadline)
+          d.stageDueAt = previousDeadline;
+        if (d.selfServe && target === "explored" && previousDeadline)
+          d.stageDueAt = previousDeadline;
         await Task.updateMany(
           {
             lead: d.lead,
@@ -201,7 +212,7 @@ export async function advanceDemo(
             {
               $setOnInsert: {
                 lead: d.lead,
-                owner: l.owner,
+                owner: d.selfServe ? d.owner : l.owner,
                 title: {
                   interested: "Agree a demo walkthrough time",
                   questions: "Answer customer’s demo questions",
@@ -222,6 +233,7 @@ export async function advanceDemo(
       }
       if (target === "sent") {
         d.sentAt ||= now;
+        d.sentBy ||= actor;
         d.channel = b.channel;
       }
       if (target === "explored" && trustedEntry) {
