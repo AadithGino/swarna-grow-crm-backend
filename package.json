@@ -7,6 +7,9 @@
   "scripts": {
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
+    "pm2:start": "pm2 start ecosystem.config.cjs",
+    "pm2:restart": "pm2 restart swarna-grow-crm-api",
+    "pm2:stop": "pm2 stop swarna-grow-crm-api",
     "seed:admin": "node src/utils/seedAdmin.js",
     "export:leads": "node scripts/exportLeadsBeforeDate.js",
     "test": "node --test src/**/*.test.js"
