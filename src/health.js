@@ -60,7 +60,7 @@ export async function healthSnapshot() {
   );
   const capture = await Setting.findOne({ key: "metaCheck" });
   if (
-    process.env.META_FORM_IDS &&
+    (process.env.META_FORM_IDS || process.env.META_PAGE_ID || process.env.META_PAGE_TOKEN) &&
     (!process.env.META_PAGE_TOKEN ||
       !capture?.value?.ok ||
       Date.now() - +new Date(capture.value.at || 0) > 30 * 60000)
@@ -68,7 +68,7 @@ export async function healthSnapshot() {
     stale.push("capture_reconciliation");
   if (
     await Import.exists({
-      status: { $in: ["pending", "failed", "needs_review"] },
+      status: { $in: ["pending", "failed", "needs_review", "processing"] },
       createdAt: { $lt: new Date(Date.now() - 15 * 60000) },
     })
   )

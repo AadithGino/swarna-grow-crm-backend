@@ -120,6 +120,8 @@ export async function advanceDemo(
 ) {
   const old = await Demo.findById(id);
   if (!old) throw fail("Demo missing");
+  if (b.expectedRevision != null && Number(b.expectedRevision) !== (old.stageRevision || 0))
+    throw Object.assign(Error("Demo changed. Refresh before updating"), { status: 409 });
   const target = b.status || old.status;
   if (
     target !== old.status &&
@@ -153,6 +155,16 @@ export async function advanceDemo(
     )
   )
     throw fail("Select the actual customer response");
+  const walkthroughActions = {
+    send_quote: { title: "Send quote after demo", kind: "send_proposal" },
+    decision_maker: { title: "Call the decision-maker after demo", kind: "call" },
+    awaiting_decision: { title: "Check decision after demo", kind: "call" },
+  };
+  const walkthroughAction = b.walkthroughCompleted === true &&
+    Object.hasOwn(walkthroughActions, b.walkthroughNextAction) && walkthroughActions[b.walkthroughNextAction];
+  if (target === "responded" && b.walkthroughCompleted === true &&
+      (!walkthroughAction || !b.nextAt || !Number.isFinite(+new Date(b.nextAt)) || new Date(b.nextAt) <= now))
+    throw fail("Choose a next step and future deadline for the completed demo");
   if (target === "responded" && b.customerResponse === "not_now" && !b.nextAt)
     throw fail("Choose when the customer wants to hear from you");
   if (target === "problem" && !b.problem?.trim() && !old.problem)
@@ -213,15 +225,15 @@ export async function advanceDemo(
               $setOnInsert: {
                 lead: d.lead,
                 owner: d.selfServe ? d.owner : l.owner,
-                title: {
+                title: walkthroughAction?.title || {
                   interested: "Agree a demo walkthrough time",
                   questions: "Answer customer’s demo questions",
                   not_now: "Call back about demo at agreed time",
                   not_interested: "Review demo decline and decide whether to close",
                 }[b.customerResponse],
-                kind: b.customerResponse === "interested" ? "confirm_meeting"
-                  : b.customerResponse === "not_interested" ? "internal" : "call",
-                customerFacing: b.customerResponse !== "not_interested",
+                kind: walkthroughAction?.kind || (b.customerResponse === "interested" ? "confirm_meeting"
+                  : b.customerResponse === "not_interested" ? "internal" : "call"),
+                customerFacing: !!walkthroughAction || b.customerResponse !== "not_interested",
                 fixed: b.customerResponse === "not_now",
                 dueAt: due,
                 originalDueAt: due,
@@ -241,6 +253,7 @@ export async function advanceDemo(
         d.visits++;
       }
       if (b.problem) d.problem = b.problem;
+      if (target === "responded" && b.walkthroughCompleted === true) d.walkthroughCompletedAt ||= now;
       if (b.customerResponse) d.customerResponse = b.customerResponse;
       if (b.responseNote) d.responseNote = b.responseNote;
       await d.save({ session });

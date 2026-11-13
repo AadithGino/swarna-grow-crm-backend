@@ -84,6 +84,10 @@ export async function applySalesOutcome({
     { $inc: { workflowRevision: 1 } },
     { session }
   );
+  if (b.outcome !== "no_answer" && b.outcome !== "unreachable" && lead.retryReviewAt) {
+    lead.retryReviewAt = undefined;
+    await Task.updateMany({ lead: lead.id, status: "open", key: /^retry-review:/ }, { $set: { status: "done", doneAt: now } }, { session });
+  }
   if (closed.includes(b.outcome)) {
     lead.stage = "Lost";
     lead.closeReason = b.outcome;
@@ -103,7 +107,7 @@ export async function applySalesOutcome({
     if (lead.doNotContact || ["Won", "Lost"].includes(lead.stage))
       throw fail("Reopen the lead before scheduling sales work.");
     if (booking) {
-      const m = await bookMeeting(lead, booking, session, sourceCall?._id);
+      const m = await bookMeeting(lead, booking, session, sourceCall?._id, actor.id);
       lead.stage = "Demo/Meeting";
       lead.pauseUntil = booking.start;
       if (sourceCall) {
@@ -189,6 +193,7 @@ export async function applySalesOutcome({
           now,
           attempts: attempts + 1,
         });
+        if (next?.kind === "internal") lead.retryReviewAt ||= now;
         if (next)
           await add(
             source,
@@ -293,6 +298,11 @@ export async function completeSalesTask(id, user, body) {
 
 export async function completeMeetingOutcome(id, user, body) {
   const existing = await Meeting.findById(id);
+  const checkRevision = meeting => {
+    if (body.expectedRevision && +meeting?.updatedAt !== +new Date(body.expectedRevision))
+      throw Object.assign(Error("Meeting changed. Refresh the queue."), { status: 409 });
+  };
+  checkRevision(existing);
   if (existing?.resultSaved) return existing;
   const prepared = await prepareSalesOutcome(body.salesOutcome);
   if (
@@ -308,6 +318,14 @@ export async function completeMeetingOutcome(id, user, body) {
     await session.withTransaction(async () => {
       const m = await Meeting.findById(id).session(session);
       if (!m) throw fail("Meeting not found.");
+      checkRevision(m);
+      if (body.expectedTask) {
+        const snapshot = body.expectedTask;
+        const task = await Task.findById(snapshot.id).session(session);
+        if (!task || task.status !== "open" || String(task.owner || "") !== String(snapshot.owner || "") ||
+            +task.dueAt !== +new Date(snapshot.dueAt) || +task.updatedAt !== +new Date(snapshot.revision))
+          throw Object.assign(Error("Confirmation changed. Refresh the queue."), { status: 409 });
+      }
       if (m.resultSaved) {
         result = m;
         return;
@@ -343,6 +361,9 @@ export async function completeMeetingOutcome(id, user, body) {
         session,
         prepared,
       });
+      if (body.status === "no_show" && prepared.b.outcome === "callback")
+        await Task.updateOne({ key: `meeting-next:${m.id}` },
+          { $set: { title: "Call to rebook missed meeting", meeting: m.id, fixed: false } }, { session });
       result = m;
     });
   } finally {

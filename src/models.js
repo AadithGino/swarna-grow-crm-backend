@@ -51,6 +51,7 @@ export const Lead = model(
     workflowRevision: { type: Number, default: 0 },
     doNotContact: { type: Boolean, default: false },
     pauseUntil: Date,
+    retryReviewAt: Date,
     location: String,
     decisionMaker: String,
     needs: String,
@@ -106,7 +107,7 @@ export const Task = model(
       },
     ],
   },
-  [[{ owner: 1, status: 1, dueAt: 1 }, {}]]
+  [[{ owner: 1, status: 1, dueAt: 1 }, {}], [{ lead: 1, status: 1, dueAt: 1 }, {}]]
 );
 export const Activity = model("Activity", {
   lead: { type: Schema.Types.ObjectId, ref: "Lead" },
@@ -137,10 +138,13 @@ export const Call = model(
     notes: String,
     recordingKey: String,
     recordingBytes: Number,
+    recordingContentType: String,
     recordingStatus: { type: String, default: "missing" },
     aiStatus: { type: String, default: "waiting" },
     transcript: String,
     coachingReview: Schema.Types.Mixed,
+    managementReview: Schema.Types.Mixed,
+    leadOwnerAtCall: ref,
     ai: Schema.Types.Mixed,
     aiError: String,
     outcomeSaved: { type: Boolean, default: false },
@@ -153,9 +157,10 @@ export const Call = model(
     autoNextAt: Date,
     meeting: { type: Schema.Types.ObjectId, ref: "Meeting" },
   },
-  [[{ agent: 1, startedAt: -1 }, {}]]
+  [[{ agent: 1, startedAt: -1 }, {}], [{ lead: 1, startedAt: -1, _id: -1 }, {}], [{ startedAt: -1, _id: -1 }, {}]]
 );
 export const Meeting = model("Meeting", {
+  bookedBy: ref,
   sourceCall: {
     type: Schema.Types.ObjectId,
     ref: "Call",
@@ -190,6 +195,7 @@ export const Demo = model("Demo", {
   channel: String,
   expiresAt: Date,
   firstExploredAt: Date,
+  walkthroughCompletedAt: Date,
   visits: { type: Number, default: 0 },
   problem: String,
   stageDueAt: Date,
@@ -200,10 +206,13 @@ export const Demo = model("Demo", {
   responseNote: String,
 });
 export const Proposal = model("Proposal", {
+  sourceTask: { type: Schema.Types.ObjectId, ref: "Task" },
   lead: { type: Schema.Types.ObjectId, ref: "Lead" },
   owner: ref,
   version: Number,
   amount: Number,
+  setupFee: Number,
+  monthlyFee: Number,
   url: String,
   status: { type: String, default: "draft" },
   sentAt: Date,
@@ -226,6 +235,12 @@ export const Import = model("Import", {
   lead: { type: Schema.Types.ObjectId, ref: "Lead" },
   formId: String,
   sourceCreatedAt: Date,
+  processingToken: String,
+  webhookAt: Date,
+  reviewDecision: String,
+  reviewedAt: Date,
+  reviewedBy: ref,
+  reviewReason: String,
   attempts: { type: Number, default: 0 },
   nextAttemptAt: Date,
 });
@@ -244,6 +259,7 @@ export const Notification = model(
     title: String,
     body: String,
     category: String,
+    snapshot: Schema.Types.Mixed,
     severity: String,
     dueAt: Date,
     exception: { type: Schema.Types.ObjectId, ref: "Exception" },
@@ -279,6 +295,8 @@ export const Exception = model(
     detail: String,
     lead: { type: Schema.Types.ObjectId, ref: "Lead" },
     task: { type: Schema.Types.ObjectId, ref: "Task" },
+    meeting: { type: Schema.Types.ObjectId, ref: "Meeting" },
+    call: { type: Schema.Types.ObjectId, ref: "Call" },
     owner: ref,
     status: { type: String, default: "open" },
     generation: { type: Number, default: 1 },
@@ -310,3 +328,19 @@ export const Handover = model(
     ],
   ]
 );
+
+export const Attendance = model("Attendance", {
+  agent: { ...ref, required: true },
+  day: { type: String, required: true },
+  checkedInAt: Date,
+  checkedOutAt: Date,
+}, [[{ agent: 1, day: 1 }, { unique: true }]]);
+
+export const CoachingAction = model("CoachingAction", {
+  call: { type: Schema.Types.ObjectId, ref: "Call", required: true },
+  agent: ref,
+  manager: ref,
+  step: { type: String, required: true },
+  excerpt: String,
+  improvement: String,
+}, [[{ call: 1, step: 1 }, { unique: true }]]);

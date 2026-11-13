@@ -649,7 +649,7 @@ test("source enquiry for closed lead is flagged for review instead of silently t
   const r = await auth(
     request(app).post(`/imports/${i.id}/review`),
     manager
-  ).send({ reason: "Duplicate historical submission; verified with owner" });
+  ).send({ decision: "invalid", reason: "Duplicate historical submission; verified with owner" });
   assert.equal(r.status, 200);
   await operationsSweep();
   assert.equal(
@@ -803,4 +803,409 @@ test("manager queue and on-time counts use outstanding work and original deadlin
   const staff = report.body.employees.find(row => row.id === agent.id);
   assert.equal(staff.monitoring.followUpsDue.length, 2);
   assert.equal(staff.monitoring.followUpsOnTime.length, 1);
+});
+
+test("attendance actions are idempotent and management reports require a manager", async () => {
+  const first = await auth(request(app).post("/attendance/in")).send({});
+  assert.equal(first.status, 200);
+  const repeated = await auth(request(app).post("/attendance/in")).send({});
+  assert.equal(repeated.body.checkedInAt, first.body.checkedInAt);
+  const out = await auth(request(app).post("/attendance/out")).send({});
+  assert.ok(out.body.checkedOutAt);
+  const path = `/management/report?agent=${agent.id}&from=${first.body.day}&to=${first.body.day}`;
+  assert.equal((await auth(request(app).get(path))).status, 403);
+  const report = await auth(request(app).get(path), manager);
+  assert.equal(report.status, 200);
+  assert.equal(report.body.attendance[0].checkedOutAt, out.body.checkedOutAt);
+  assert.equal((await auth(request(app).get(path.replace(/from=[^&]+/, "from=2026-02-30")), manager)).status, 422);
+});
+
+test("management report uses IST date boundaries and shows gaps from call end", async () => {
+  const day = "2026-11-11";
+  await Call.create([
+    { clientId: "before-ist", agent: agent.id, direction: "outgoing", startedAt: new Date("2026-11-10T18:29:59Z") },
+    { clientId: "first-ist", agent: agent.id, direction: "outgoing", startedAt: new Date("2026-11-10T18:30:00Z"), endedAt: new Date("2026-11-10T18:35:00Z"), answeredAt: new Date("2026-11-10T18:30:01Z"), activeMs: 60000 },
+    { clientId: "second-ist", agent: agent.id, direction: "outgoing", startedAt: new Date("2026-11-10T18:45:00Z") },
+  ]);
+  const report = await auth(request(app).get(`/management/report?agent=${agent.id}&from=${day}&to=${day}`), manager);
+  assert.equal(report.status, 200);
+  assert.equal(report.body.stats.attempts, 2);
+  assert.equal(report.body.stats.answered, 1);
+  assert.equal(report.body.attendance[0].gap.ms, 600000);
+});
+
+test("day-end reports and meeting reminders are delivered once per recipient", async () => {
+  const { managementReminders } = await import("../src/management.js");
+  const now = new Date("2026-11-11T15:00:00Z");
+  await Call.create({ clientId: "daily", agent: agent.id, direction: "outgoing", startedAt: new Date(+now - 3600000) });
+  await Meeting.create({ lead: lead.id, bookedBy: agent.id, reps: [agent.id], status: "scheduled", start: new Date(+now + 600000) });
+  await managementReminders(now);
+  await managementReminders(now);
+  assert.equal(await Notification.countDocuments({ user: manager.id, category: "daily_report" }), 1);
+  assert.equal(await Notification.countDocuments({ user: manager.id, category: "meeting" }), 1);
+  assert.equal(await Notification.countDocuments({ user: agent.id, category: "meeting" }), 1);
+});
+
+test("manager queue claims a task once and detects stale ownership", async () => {
+  const dueAt = new Date(Date.now() - 60000);
+  const task = await Task.create({ lead: lead.id, owner: agent.id, title: "Callback", kind: "call", dueAt, originalDueAt: dueAt, key: "queue-claim-test" });
+  const queue = await auth(request(app).get("/management/action-queue"), manager);
+  const item = queue.body.find(row => row.id === task.id);
+  assert.ok(item);
+  const snapshot = { expectedOwner: agent.id, expectedDueAt: item.dueAt, revision: item.revision };
+  const path = `/management/action-queue/task/${task.id}`;
+  assert.equal((await auth(request(app).post(path)).send({ action: "claim", ...snapshot })).status, 403);
+  const claimed = await auth(request(app).post(path), manager).send({ action: "claim", ...snapshot });
+  assert.equal(claimed.body.owner, manager.id);
+  const stale = await auth(request(app).post(path), manager).send({ action: "claim", ...snapshot });
+  assert.equal(stale.status, 409);
+});
+
+test("no-show and named rebooking callback are committed together", async () => {
+  const meeting = await Meeting.create({ lead: lead.id, reps: [agent.id], status: "scheduled",
+    start: new Date(Date.now() - 7200000), end: new Date(Date.now() - 3600000) });
+  const path = `/management/action-queue/meeting/${meeting.id}`;
+  const snapshot = { expectedOwner: agent.id, expectedDueAt: meeting.end, revision: meeting.updatedAt };
+  const invalid = await auth(request(app).post(path), manager).send({ action: "no_show", owner: agent.id, ...snapshot });
+  assert.equal(invalid.status, 422);
+  assert.equal((await Meeting.findById(meeting.id)).status, "scheduled");
+  const payload = { action: "no_show", owner: agent.id, dueAt: future(), ...snapshot };
+  const result = await auth(request(app).post(path), manager).send(payload);
+  assert.equal(result.body.status, "no_show");
+  assert.equal((await auth(request(app).post(path), manager).send(payload)).status, 409);
+  const tasks = await Task.find({ key: `meeting-next:${meeting.id}` });
+  assert.equal(tasks.length, 1);
+  assert.equal(String(tasks[0].owner), agent.id);
+  assert.equal(tasks[0].title, "Call to rebook missed meeting");
+});
+
+test("completed demo requires a dated next step and creates a quote task", async () => {
+  const demo = await Demo.create({ lead: lead.id, owner: agent.id, token: "demo-close-test", status: "sent" });
+  const path = `/demos/${demo.id}`;
+  const payload = { status: "responded", customerResponse: "interested", walkthroughCompleted: true };
+  const bad = await auth(request(app).patch(path)).send(payload);
+  assert.equal(bad.status, 422);
+  assert.equal((await Demo.findById(demo.id)).status, "sent");
+  const ok = await auth(request(app).patch(path)).send({ ...payload, walkthroughNextAction: "send_quote", nextAt: future() });
+  assert.equal(ok.status, 200);
+  assert.ok(ok.body.walkthroughCompletedAt);
+  assert.equal((await Task.findOne({ key: `demo-response-next:${demo.id}` })).kind, "send_proposal");
+});
+
+test("shared coaching is agent-scoped and tracks reviewed later calls", async () => {
+  const call = await Call.create({ clientId: "coaching-action-test", agent: agent.id, answeredAt: new Date() });
+  const payload = { callId: call.id, step: "discovery", excerpt: "We only use paper cards.", improvement: "Ask how renewals are tracked." };
+  const shared = await auth(request(app).post("/management/coaching"), manager).send(payload);
+  assert.equal(shared.status, 200);
+  await Call.create({ clientId: "coaching-progress-test", agent: agent.id, startedAt: future(), coachingReview: { checks: { discovery: "done" } } });
+  const own = await auth(request(app).get("/coaching-actions"));
+  assert.equal(own.body[0].progress[0].status, "covered");
+  assert.equal((await auth(request(app).get("/coaching-actions"), backup)).body.length, 0);
+});
+
+test("lead source funnel uses the latest sent split quote and counts milestones once", async () => {
+  const { Proposal } = await import("../src/models.js");
+  const { sourceFunnel } = await import("../src/managerActions.js");
+  await Lead.updateOne({ _id: lead.id }, { $set: { source: "Meta", stage: "Won" } });
+  await Call.create({ clientId: "funnel-connection-test", lead: lead.id, answeredAt: new Date() });
+  await Demo.create({ lead: lead.id, token: "funnel-complete-test", walkthroughCompletedAt: new Date() });
+  await Proposal.create([
+    { lead: lead.id, amount: 120, setupFee: 100, monthlyFee: 20, sentAt: new Date(Date.now() - 60000) },
+    { lead: lead.id, amount: 230, setupFee: 200, monthlyFee: 30, sentAt: new Date() },
+    { lead: lead.id, amount: 999, setupFee: 999, monthlyFee: 0 },
+  ]);
+  const [row] = await sourceFunnel({ $gte: new Date(Date.now() - 3600000), $lt: future() }, agent.id);
+  assert.deepEqual([row.leads, row.connected, row.demoCompleted, row.quoted, row.won], [1, 1, 1, 1, 1]);
+  assert.deepEqual([row.setupWon, row.monthlyWon], [200, 30]);
+});
+
+test("sending a linked demo proposal completes both send tasks and creates one decision call", async () => {
+  const source = await Task.create({ lead: lead.id, owner: agent.id, key: "demo-response-next:quote-link",
+    kind: "send_proposal", title: "Send quote after demo", dueAt: future() });
+  const create = () => auth(request(app).post("/proposals")).send({ lead: lead.id, sourceTask: source.id, amount: 30000 });
+  const quote = await create();
+  assert.equal(quote.status, 200);
+  assert.equal(quote.body.sourceTask, source.id);
+  assert.equal((await create()).body._id, quote.body._id);
+  const send = () => auth(request(app).post(`/proposals/${quote.body._id}/sent`)).send({ nextAt: future() });
+  assert.equal((await send()).status, 200);
+  assert.equal((await send()).status, 200);
+  assert.equal((await Task.findById(source.id)).status, "done");
+  assert.equal((await Task.findOne({ key: `proposal-send:${quote.body._id}` })).status, "done");
+  assert.equal(await Task.countDocuments({ key: `proposal-follow:${quote.body._id}` }), 1);
+});
+
+test("queue rejects stale deadlines even when ownership is unchanged", async () => {
+  const task = await Task.create({ lead: lead.id, owner: agent.id, key: "queue-stale-date", kind: "call",
+    title: "Callback", dueAt: new Date(Date.now() - 60000) });
+  const snapshot = { expectedOwner: agent.id, expectedDueAt: task.dueAt, revision: task.updatedAt };
+  const path = `/management/action-queue/task/${task.id}`;
+  const payload = { ...snapshot, action: "reschedule", dueAt: future(), reason: "Manager moved callback" };
+  assert.equal((await auth(request(app).post(path), manager).send(payload)).status, 200);
+  assert.equal((await auth(request(app).post(path), manager).send({ ...payload, dueAt: new Date(Date.now() + 172800000) })).status, 409);
+});
+
+test("queue confirmation closes its task and an attended outcome schedules a callback", async () => {
+  const meeting = await Meeting.create({ lead: lead.id, reps: [agent.id], status: "scheduled", start: future(), end: future() });
+  const task = await Task.create({ lead: lead.id, owner: agent.id, key: `meeting-confirm:${meeting.id}`, kind: "confirmation", dueAt: new Date() });
+  const confirm = await auth(request(app).post(`/management/action-queue/task/${task.id}`), manager).send({
+    action: "confirm", expectedOwner: agent.id, expectedDueAt: task.dueAt, revision: task.updatedAt,
+  });
+  assert.equal(confirm.body.confirmed, true);
+  assert.equal((await Task.findById(task.id)).status, "done");
+  const ended = await Meeting.create({ lead: lead.id, reps: [agent.id], status: "scheduled",
+    start: new Date(Date.now() - 7200000), end: new Date(Date.now() - 3600000) });
+  const result = await auth(request(app).post(`/management/action-queue/meeting/${ended.id}`), manager).send({
+    action: "attended", owner: agent.id, dueAt: future(), reason: "Discussed pricing",
+    expectedOwner: agent.id, expectedDueAt: ended.end, revision: ended.updatedAt,
+  });
+  assert.equal(result.body.status, "completed");
+  assert.ok(await Task.exists({ key: `meeting-next:${ended.id}`, owner: agent.id }));
+});
+
+test("changed coaching feedback reports conflict and keeps the shared revision", async () => {
+  const call = await Call.create({ clientId: "coaching-duplicate", agent: agent.id, answeredAt: new Date() });
+  const send = improvement => auth(request(app).post("/management/coaching"), manager).send({
+    callId: call.id, step: "discovery", excerpt: "We use paper cards.", improvement,
+  });
+  assert.equal((await send("Ask about renewals.")).status, 200);
+  assert.equal((await send("Ask about reminders.")).status, 409);
+  const own = await auth(request(app).get("/coaching-actions"));
+  assert.equal(own.body[0].improvement, "Ask about renewals.");
+});
+
+test("pending work alone generates tomorrow and overdue sections", async () => {
+  const { managementReminders } = await import("../src/management.js");
+  const now = new Date("2027-03-22T15:00:00Z");
+  await Task.create([
+    { lead: lead.id, owner: agent.id, key: "report-tomorrow", title: "Tomorrow callback", kind: "call", dueAt: new Date("2027-03-23T04:00:00Z") },
+    { lead: lead.id, owner: agent.id, key: "report-overdue", title: "Overdue callback", kind: "call", dueAt: new Date("2027-03-22T04:00:00Z") },
+  ]);
+  await Meeting.create({ lead: lead.id, bookedBy: agent.id, reps: [backup.id], confirmed: true,
+    status: "scheduled", start: new Date("2027-03-23T05:00:00Z"), end: new Date("2027-03-23T06:00:00Z") });
+  await managementReminders(now);
+  const report = await Notification.findOne({ user: manager.id, category: "daily_report", title: `${agent.name} · 2027-03-22` });
+  assert.match(report.body, /^Tomorrow’s commitments \(2\)[^\n]*\nConfirmed meeting[^\n]*\nTomorrow callback/);
+  assert.match(report.body, /Overdue backlog \(1\)\nOverdue callback/);
+});
+
+test("import review requires a disposition and links an owned contact deadline", async () => {
+  const item = await Import.create({ externalId: "review-linked", status: "failed", sourceCreatedAt: new Date() });
+  const resolve = body => auth(request(app).post(`/imports/${item.id}/review`), manager).send(body);
+  assert.equal((await resolve({ reason: "Checked" })).status, 422);
+  const result = await resolve({ decision: "link_existing", lead: lead.id, reason: "Verified the customer's phone" });
+  assert.equal(result.status, 200);
+  assert.ok(result.body.commitment.dueAt);
+  assert.ok(await Task.exists({ lead: lead.id, owner: agent.id, key: `import-review:${item.id}`, status: "open" }));
+  assert.equal((await resolve({ decision: "invalid", reason: "Changed" })).status, 409);
+});
+
+test("queue shows missing venue and overdue demo preparation", async () => {
+  const dueAt = new Date(Date.now() - 60000);
+  const demo = await Demo.create({ lead: lead.id, token: "queue-stage" });
+  await Task.create([
+    { key: "meeting-place:pending", lead: lead.id, owner: agent.id, dueAt, kind: "meeting_prep" },
+    { key: "demo-stage:pending", lead: lead.id, owner: agent.id, dueAt, kind: "internal", demo: demo.id },
+  ]);
+  const result = await auth(request(app).get("/management/action-queue"), manager);
+  assert.equal(result.status, 200);
+  assert.ok(result.body.some(row => row.taskKey === "meeting-place:pending"));
+  assert.ok(result.body.some(row => row.taskKey === "demo-stage:pending"));
+});
+
+test("queue meeting attendance can close a lead without a callback", async () => {
+  const meeting = await Meeting.create({ lead: lead.id, bookedBy: agent.id, status: "scheduled",
+    start: new Date(Date.now() - 7200000), end: new Date(Date.now() - 3600000) });
+  const response = await auth(request(app).post(`/management/action-queue/meeting/${meeting.id}`), manager).send({
+    action: "attended", expectedOwner: agent.id, expectedDueAt: meeting.end, revision: meeting.updatedAt,
+    reason: "Customer declined further contact", salesOutcome: { outcome: "do_not_contact" },
+  });
+  assert.equal(response.body.status, "completed");
+  assert.equal((await Lead.findById(lead.id)).doNotContact, true);
+  assert.equal(await Task.countDocuments({ key: `meeting-next:${meeting.id}` }), 0);
+});
+
+test("lead reassignment requires attendance choice and transfers linked work together", async () => {
+  const start = future();
+  const meeting = await Meeting.create({ lead: lead.id, reps: [agent.id], status: "scheduled",
+    start, end: new Date(+start + 3600000) });
+  const demo = await Demo.create({ lead: lead.id, owner: agent.id, token: "transfer-active-demo" });
+  const prep = await Task.create({ lead: lead.id, owner: agent.id, kind: "meeting_prep",
+    dueAt: start, key: `meeting-place:${meeting.id}` });
+  const transfer = body => auth(request(app).patch(`/leads/${lead.id}`), manager)
+    .send({ owner: backup.id, taskTransfer: "transfer", ...body });
+  assert.equal((await transfer({})).status, 422);
+  const clash = await Meeting.create({ lead: lead.id, reps: [backup.id], status: "scheduled",
+    start, end: new Date(+start + 3600000) });
+  assert.equal((await transfer({ meetingTransfer: "replace" })).status, 409);
+  assert.equal(String((await Task.findById(prep.id)).owner), agent.id);
+  assert.equal(String((await Demo.findById(demo.id)).owner), agent.id);
+  await clash.deleteOne();
+  assert.equal(String((await Lead.findById(lead.id)).owner), agent.id);
+  const result = await transfer({ meetingTransfer: "replace" });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(String((await Lead.findById(lead.id)).owner), backup.id);
+  assert.equal(String((await Demo.findById(demo.id)).owner), backup.id);
+  assert.equal(String((await Task.findById(prep.id)).owner), backup.id);
+  assert.equal(String((await Meeting.findById(meeting.id)).reps[0]), backup.id);
+});
+
+test("historical management periods exclude live calendar and demo activity", async () => {
+  const { managementReport } = await import("../src/management.js");
+  const meeting = await Meeting.create({ lead: lead.id, bookedBy: agent.id, status: "scheduled", start: future() });
+  const demo = await Demo.create({ lead: lead.id, owner: agent.id, token: "report-live-demo", status: "sent", sentAt: new Date() });
+  const report = await managementReport(agent.id, "2024-01-01", "2024-01-02");
+  assert.equal(report.meetings.length, 0);
+  assert.equal(report.demos.length, 0);
+  assert.ok(report.live.upcomingMeetings.some(row => row._id.equals(meeting.id)));
+  assert.ok(report.live.demos.some(row => row._id.equals(demo.id)));
+});
+
+test("Nurture requires a date and saves a customer callback with the stage", async () => {
+  const update = body => auth(request(app).patch(`/leads/${lead.id}`), manager).send({ stage: "Nurture", ...body });
+  assert.equal((await update({})).status, 422);
+  const pauseUntil = future();
+  assert.equal((await update({ pauseUntil })).status, 200);
+  assert.ok(await Task.exists({ lead: lead.id, status: "open", dueAt: pauseUntil, fixed: true, key: /^nurture:/ }));
+});
+
+test("confirmed meeting flags an unavailable attendee independently of the lead owner", async () => {
+  await User.updateOne({ _id: backup.id }, { $set: { availability: "away" } });
+  const start = future();
+  const meeting = await Meeting.create({ lead: lead.id, confirmed: true, reps: [backup.id],
+    start, end: new Date(+start + 3600000) });
+  await operationsSweep();
+  assert.ok(await Exception.exists({ key: `meeting-coverage:${meeting.id}`, owner: backup.id, status: "open" }));
+});
+
+test("Meta processing claim prevents a review from committing over an in-flight import", async () => {
+  const item = await Import.create({ externalId: "claimed-import", status: "failed" });
+  await ingestMeta(async () => {
+    const review = await auth(request(app).post(`/imports/${item.id}/review`), manager)
+      .send({ decision: "invalid", reason: "Manual check" });
+    assert.equal(review.status, 409);
+    return { id: item.externalId, field_data: [{ name: "phone_number", values: [lead.phone] }] };
+  });
+  assert.equal((await Import.findById(item.id)).status, "done");
+  assert.ok(await Task.exists({ key: "meta:claimed-import" }));
+});
+
+test("Meta capture discovery flags active forms missing from reconciliation", async () => {
+  const oldPage = process.env.META_PAGE_ID;
+  process.env.META_PAGE_ID = "test-page";
+  process.env.META_FORM_IDS = "form1";
+  try {
+    await reconcileMeta(async path => path.startsWith("test-page/") ?
+      { data: [{ id: "form1", status: "ACTIVE" }, { id: "new-form", status: "ACTIVE" }] } : { data: [] });
+    const check = await Setting.findOne({ key: "metaCheck" });
+    assert.equal(check.value.ok, false);
+    assert.deepEqual(check.value.missingForms, ["new-form"]);
+  } finally {
+    if (oldPage === undefined) delete process.env.META_PAGE_ID;
+    else process.env.META_PAGE_ID = oldPage;
+  }
+});
+
+test("retry review hold prevents the sweeps from scheduling another call", async () => {
+  lead.retryReviewAt = new Date();
+  await lead.save();
+  await Task.create({ key: `retry-review:${lead.id}:test`, lead: lead.id, owner: agent.id, title: "Review unanswered lead",
+    kind: "internal", dueAt: future(), customerFacing: false });
+  const { sweep } = await import("../src/workflow.js");
+  await sweep();
+  await operationsSweep();
+  assert.equal(await Task.countDocuments({ lead: lead.id, status: "open", kind: "call" }), 0);
+});
+
+
+test("linking a missed call schedules one return call, including repeated linking", async () => {
+  const call = await Call.create({ clientId: "late-linked-inbound", agent: agent.id, number: lead.phone,
+    direction: "incoming", startedAt: new Date(Date.now() - 60000), endedAt: new Date(),
+    events: [{ type: "RINGING", at: new Date(Date.now() - 60000) }, { type: "DISCONNECTED", at: new Date() }], disconnectCode: 5 });
+  const link = () => auth(request(app).post(`/calls/${call.id}/lead`)).send({ lead: lead.id });
+  assert.equal((await link()).status, 200);
+  assert.equal((await link()).status, 200);
+  assert.equal(await Task.countDocuments({ key: `missed-incoming:${call.id}`, owner: agent.id }), 1);
+});
+
+test("manager workspace paginates lead call history and guards manual reviews", async () => {
+  const startedAt = new Date();
+  await Call.insertMany(Array.from({ length: 31 }, (_, index) => ({
+    clientId: "workspace-" + index, agent: agent.id, lead: lead.id, direction: "outgoing",
+    number: lead.phone, startedAt, answeredAt: startedAt, transcript: "Sample transcript for playback review.",
+    ...(index === 0 ? { ai: {
+      summary: "Discussed pricing", objections: ["Monthly fee"],
+      scriptAssessment: { steps: [{ key: "discovery", status: "partial" }] },
+    } } : {}),
+  })));
+  const path = "/management/workspace/leads/" + lead.id + "/calls";
+  assert.equal((await auth(request(app).get(path))).status, 403);
+  const page = await auth(request(app).get(path).query({ page: 2 }), manager).expect(200);
+  assert.equal(page.body.total, 31);
+  assert.equal(page.body.items.length, 6);
+  assert.equal(page.body.items[0].transcript, undefined);
+  const flagged = await auth(request(app).get(path).query({ pitch: "gaps" }), manager).expect(200);
+  assert.equal(flagged.body.total, 1);
+  assert.equal(flagged.body.items[0].ai.summary, "Discussed pricing");
+  assert.deepEqual(flagged.body.items[0].ai.objections, ["Monthly fee"]);
+  assert.equal(flagged.body.items[0].transcript, undefined);
+  const id = page.body.items[0]._id;
+  const detail = await auth(request(app).get("/management/workspace/calls/" + id), manager).expect(200);
+  assert.match(detail.body.call.transcript, /Sample transcript/);
+  const body = { notes: "Discovery covered", revision: detail.body.call.updatedAt };
+  await auth(request(app).post("/management/workspace/calls/" + id + "/review"), manager).send(body).expect(200);
+  await auth(request(app).post("/management/workspace/calls/" + id + "/review"), manager).send(body).expect(409);
+  const reviewed = await auth(request(app).get("/management/call-review?filter=reviewed"), manager).expect(200);
+  assert.equal(reviewed.body.total, 1);
+  assert.equal(reviewed.body.calls[0]._id, id);
+  const today = await auth(request(app).get("/management/workspace/today"), manager).expect(200);
+  assert.equal(today.body.reviews, 30);
+});
+
+test("manager workspace browses task and exception records and filters report snapshots", async () => {
+  const task = await action({ dueAt: new Date(Date.now() - 10000) });
+  const actions = await auth(request(app).get("/management/workspace/actions?status=overdue"), manager).expect(200);
+  assert.equal(actions.body.items[0]._id, task.id);
+  await Exception.create({ key: "workspace-test", title: "Missing contact", owner: agent.id, lead: lead.id, task: task.id });
+  const exceptions = await auth(request(app).get("/management/workspace/exceptions?q=contact"), manager).expect(200);
+  assert.equal(exceptions.body.items[0].task, task.id);
+  await notify(manager.id, "daily-report:2025-03-05:" + agent.id, agent.name + " · 2025-03-05", "Saved report", {
+    category: "daily_report", snapshot: { agent: agent.id, date: "2025-03-05", attempts: 3 },
+  });
+  const reports = await auth(request(app).get("/management/workspace/daily")
+    .query({ owner: agent.id, from: "2025-03-05", to: "2025-03-05" }), manager).expect(200);
+  assert.equal(reports.body.items[0].snapshot.attempts, 3);
+});
+
+
+test("manager recovery queue surfaces intake and deduplicates a task alert", async () => {
+  const task = await action({ kind: "call", dueAt: new Date(Date.now() - 60000) });
+  await Exception.create([
+    { key: "meta-stale", type: "capture", severity: "critical", title: "Intake failed", detail: "Webhook stale" },
+    { key: "overdue:" + task.id, type: "overdue", severity: "warning", title: "Late", task: task.id, lead: lead.id },
+  ]);
+  const url = "/management/leakage-queue";
+  await auth(request(app).get(url)).expect(403);
+  const { body } = await auth(request(app).get(url), manager).expect(200);
+  assert.equal(body[0].category, "capture");
+  assert.equal(body.filter(row => row.id === task.id).length, 1);
+  assert.equal(body.find(row => row.id === task.id).category, "overdue");
+  const today = await auth(request(app).get("/management/workspace/today"), manager).expect(200);
+  assert.equal(today.body.capture.detail, "Webhook stale");
+});
+
+test("rescheduling a meeting replaces the schedule atomically and rejects a stale retry", async () => {
+  const start = future();
+  const end = new Date(+start + 1800000);
+  const old = await Meeting.create({ lead: lead.id, bookedBy: agent.id, reps: [agent.id], start, end, type: "online", place: "https://example.com" });
+  await action({ key: "meeting-confirm:" + old.id, kind: "confirmation", dueAt: start });
+  const path = "/management/workspace/commitments/meeting/" + old.id;
+  const detail = await auth(request(app).get(path), manager).expect(200);
+  assert.equal(detail.body.tasks.length, 1);
+  const next = { revision: old.updatedAt, start: new Date(+start + 86400000), end: new Date(+end + 86400000) };
+  await auth(request(app).post(path + "/reschedule"), manager).send(next).expect(200);
+  assert.equal((await Meeting.findById(old.id)).status, "cancelled");
+  assert.equal((await Task.findOne({ key: "meeting-confirm:" + old.id })).status, "cancelled");
+  assert.equal(await Meeting.countDocuments({ lead: lead.id, status: "scheduled" }), 1);
+  await auth(request(app).post(path + "/reschedule"), manager).send(next).expect(409);
 });

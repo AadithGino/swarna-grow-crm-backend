@@ -27,6 +27,10 @@ export async function applyAutomaticOutcome(id) {
       if (facts.technicalResult === "missed_incoming") {
         const lead = c.lead && (await Lead.findById(c.lead).session(session));
         if (!lead || lead.doNotContact || ["Won", "Lost"].includes(lead.stage)) return;
+        const returned = await Call.exists({ _id: { $ne: c.id }, number: c.number, startedAt: { $gte: c.endedAt },
+          $or: [{ direction: "outgoing", "events.type": "DIALING" }, { answeredAt: { $gte: c.endedAt } }] }).session(session);
+        if (returned) return;
+        await Lead.updateOne({ _id: lead.id }, { $inc: { workflowRevision: 1 } }, { session });
         const dueAt = nextStep("no_answer").dueAt;
         await Task.updateOne(
           { key: `missed-incoming:${c.id}` },
@@ -69,7 +73,14 @@ export async function applyAutomaticOutcome(id) {
         status: "scheduled",
         end: { $gt: now },
       }).session(session);
-      if (protectedTask) c.autoNextAt = protectedTask.dueAt;
+      if (next.kind === "internal" && !protectedTask && !meeting) {
+        lead.retryReviewAt ||= now;
+        await lead.save({ session });
+        await Task.updateOne({ key: `retry-review:${lead.id}:${+lead.retryReviewAt}` },
+          { $setOnInsert: { lead: lead.id, owner: lead.owner, kind: "internal", title: next.title,
+            dueAt: next.dueAt, originalDueAt: next.dueAt, customerFacing: false } }, { session, upsert: true });
+        c.autoNextAt = next.dueAt;
+      } else if (protectedTask) c.autoNextAt = protectedTask.dueAt;
       else if (!meeting) {
         const existing = await Task.findOne({
           lead: lead.id,

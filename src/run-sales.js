@@ -1,3 +1,4 @@
+import { managementReminders } from "./management.js";
 import { connect, loop } from "./bootstrap.js";
 import { leased } from "./health.js";
 import { sweep } from "./workflow.js";
@@ -15,6 +16,7 @@ loop(
       }))
         await initializeDemo(d.id);
       await operationsSweep();
+      await managementReminders();
     }),
   15000
 );

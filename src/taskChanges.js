@@ -8,6 +8,8 @@ import { issue } from "./operations.js";
 const fail = (m, status = 422) => Object.assign(Error(m), { status });
 export async function changeTask(id, user, b) {
   if (b.complete && b.dueAt) throw fail("Choose reschedule or complete");
+  if (b.complete && await Task.exists({ _id: id, status: "open", $or: [{ kind: "send_proposal", key: /^demo-response-next:/ }, { key: /^proposal-send:/ }] }))
+    throw fail("Send the linked proposal and schedule its decision follow-up first", 409);
   if (b.complete && b.outcome) return completeSalesTask(id, user, b);
   const old = await Task.findById(id);
   if (
@@ -76,6 +78,11 @@ export async function changeTask(id, user, b) {
   try {
     await session.withTransaction(async () => {
       const t = await Task.findById(id).session(session);
+      if (b.queueSnapshot && (t.status !== "open" ||
+          String(t.owner || "") !== String(b.queueSnapshot.owner || "") ||
+          +t.dueAt !== +new Date(b.queueSnapshot.dueAt) ||
+          +t.updatedAt !== +new Date(b.queueSnapshot.revision)))
+        throw fail("Action changed. Refresh to see the current owner and deadline.", 409);
       if (t.status !== "open") {
         result = t;
         return;
@@ -111,6 +118,11 @@ export async function changeTask(id, user, b) {
         t.dueAt = new Date(b.dueAt);
       }
       if (b.complete) {
+        if (l.retryReviewAt && t.title === "Review unanswered lead") {
+          if (!b.nextAt) throw fail("Choose a dated next action, or close the lead from Manage opportunity");
+          l.retryReviewAt = undefined;
+          await l.save({ session });
+        }
         if (
           !b.nextAt &&
           activeLead(l) &&

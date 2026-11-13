@@ -61,22 +61,28 @@ after(async () => {
 });
 test("unauthenticated reads blocked", async () =>
   assert.equal((await request(app).get("/leads")).status, 401));
-test("lead capture deduplicates and creates one accountable first action", async () => {
+test("lead capture preserves repeat enquiries and deduplicates a replay", async () => {
   let r = await auth(request(app).post("/leads")).send({
     name: "Kairali",
     phone: "9876543210",
     owner: agent.id,
     source: "Referral",
+    requestId: "first-referral",
   });
   assert.equal(r.status, 201);
   lead = r.body;
   let dupe = await auth(request(app).post("/leads")).send({
-    name: "Duplicate",
+    name: "Repeat referral",
     phone: "+919876543210",
+    requestId: "repeat-referral",
   });
   assert.equal(dupe.body.duplicate, true);
   assert.equal(await Lead.countDocuments(), 1);
-  assert.equal(await Task.countDocuments({ lead: lead._id }), 1);
+  const replay = await auth(request(app).post("/leads")).send({
+    name: "Repeat referral", phone: "+919876543210", requestId: "repeat-referral",
+  });
+  assert.equal(replay.body.enquiry, dupe.body.enquiry);
+  assert.equal(await Task.countDocuments({ lead: lead._id }), 2);
 });
 test("employee cannot access manager-only reports or unassigned leads", async () => {
   assert.equal(
@@ -394,4 +400,29 @@ test("fresh priority lead paused by customer gets one internal daily task", asyn
   const t = await Task.find({ lead: l.id, key: /^ultra:/ });
   assert.equal(t.length, 1);
   assert.equal(t[0].kind, "internal");
+});
+
+test("recording presign omits empty-body checksum and recovers an already PUT object", async () => {
+  const { s3 } = await import("../src/storage.js");
+  const original = s3.send;
+  const credentials = s3.config.credentials;
+  s3.config.credentials = async () => ({ accessKeyId: "test-key", secretAccessKey: "test-secret" });
+  const c = await Call.create({ clientId: "recording-retry-test", agent: agent.id, endedAt: new Date() });
+  const reserve = () => auth(request(app).post(`/calls/${c.id}/upload`), agentToken)
+    .send({ bytes: 9, contentType: "audio/mpeg", protocol: 2 });
+  try {
+    const signed = await reserve();
+    assert.equal(signed.status, 200);
+    const query = new URL(signed.body.url).searchParams;
+    assert.equal(query.has("x-amz-checksum-crc32"), false);
+    assert.match(query.get("X-Amz-SignedHeaders"), /if-none-match/);
+    assert.equal(signed.body.headers["If-None-Match"], "*");
+    s3.send = async () => ({ ContentLength: 9, ContentType: "audio/mpeg" });
+    assert.equal((await reserve()).body.uploaded, true);
+    assert.equal((await reserve()).body.uploaded, true);
+    assert.equal(await Job.countDocuments({ call: c.id }), 1);
+  } finally {
+    s3.send = original;
+    s3.config.credentials = credentials;
+  }
 });

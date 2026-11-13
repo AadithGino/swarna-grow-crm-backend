@@ -27,6 +27,8 @@ import {
   Activity,
   Notification,
   Exception,
+  Attendance,
+  CoachingAction,
 } from "./models.js";
 import { phone } from "./rules.js";
 import { sweep } from "./workflow.js";
@@ -47,7 +49,7 @@ function e164(i) {
 
 /** Phones used for the 8 demo leads — used for optional reset */
 function demoPhoneList() {
-  return [1, 2, 3, 4, 5, 6, 7, 8].map((i) => e164(i));
+  return Array.from({ length: 14 }, (_, i) => e164(i + 1));
 }
 
 function daysAgo(n) {
@@ -722,6 +724,264 @@ await notify(
   `${DEMO_TAG} Past meeting still shows scheduled; update outcome in app.`,
   { category: "reminder", lead: nakshatra.id, severity: "warning" }
 );
+
+const istDay = (date) => new Date(+date + 330 * 60000).toISOString().slice(0, 10);
+const atIst = (dayKey, hh, mm) => new Date(`${dayKey}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00+05:30`);
+
+const extraLeads = [
+  { slug: "malabar", name: "Malabar Pearl House", source: "Meta Lead Form", stage: "Contacting", owner: agent1, needs: "Scheme app for 3 counters", idx: 9 },
+  { slug: "lotus", name: "Lotus Gold & Diamonds", source: "WhatsApp", stage: "Qualified", owner: agent1, needs: "Replace Excel collections", idx: 10, ultra: true },
+  { slug: "kairali", name: "Kairali Jewels, Edappally", source: "Referral", stage: "Demo/Meeting", owner: agent2, needs: "Admin plus customer app", idx: 11 },
+  { slug: "poorna", name: "Poorna Gold Covering", source: "Walk-in", stage: "New", owner: agent1, needs: "First scheme this year", idx: 12 },
+  { slug: "amba", name: "Amba Jewellery, Thrissur", source: "Website", stage: "Decision", owner: agent2, needs: "Quote for two branches", idx: 13 },
+  { slug: "sree", name: "Sree Lakshmi Gold", source: "IndiaMart", stage: "Nurture", owner: agent1, needs: "Call after Onam", idx: 14, pauseUntil: hoursFromNow(24 * 20) },
+];
+for (const d of extraLeads) {
+  const ph = e164(d.idx);
+  leadsBySlug[d.slug] = await Lead.findOneAndUpdate(
+    { phone: ph },
+    {
+      $set: {
+        name: d.name,
+        phone: ph,
+        source: d.source,
+        owner: d.owner.id,
+        stage: d.stage,
+        ultra: !!d.ultra,
+        needs: d.needs,
+        firstContactDueAt: hoursAgo(6),
+        lastContactAt: hoursAgo(2),
+        ...(d.pauseUntil ? { pauseUntil: d.pauseUntil } : {}),
+      },
+    },
+    { upsert: true, new: true }
+  );
+}
+await Lead.collection.updateOne({ _id: leadsBySlug.poorna._id }, { $set: { createdAt: hoursAgo(4) } });
+await Lead.collection.updateOne({ _id: leadsBySlug.malabar._id }, { $set: { createdAt: hoursAgo(2) } });
+await Lead.collection.updateOne({ _id: silverline._id }, { $set: { createdAt: hoursAgo(26), lastContactAt: hoursAgo(1) } });
+
+const todayCalls = [
+  { key: "today-malabar", agent: agent1, lead: leadsBySlug.malabar, hours: 1.2, connected: true, activeSec: 260, outcome: "interested" },
+  { key: "today-lotus", agent: agent1, lead: leadsBySlug.lotus, hours: 2.4, connected: true, activeSec: 410, outcome: "callback" },
+  { key: "today-poorna", agent: agent1, lead: leadsBySlug.poorna, hours: 3.1, noAnswer: true },
+  { key: "today-kairali", agent: agent2, lead: leadsBySlug.kairali, hours: 1.6, connected: true, activeSec: 540, outcome: "meeting_booked" },
+  { key: "today-amba", agent: agent2, lead: leadsBySlug.amba, hours: 4, connected: true, activeSec: 190, outcome: "interested" },
+];
+for (const c of todayCalls) {
+  const started = hoursAgo(c.hours);
+  const answeredAt = c.connected ? new Date(+started + 5000) : undefined;
+  const endedAt = new Date(+started + (c.connected ? 5000 + c.activeSec * 1000 : 22000));
+  await Call.findOneAndUpdate(
+    { clientId: `demo-seed-${c.key}` },
+    {
+      $set: {
+        agent: c.agent.id,
+        lead: c.lead.id,
+        deviceId: `demo-device-${c.agent.id}`,
+        number: c.lead.phone,
+        direction: "outgoing",
+        startedAt: started,
+        answeredAt,
+        endedAt,
+        activeMs: c.connected ? c.activeSec * 1000 : 0,
+        preAnswerMs: 5000,
+        disconnectCode: c.connected ? 3 : 1,
+        endedBy: c.connected ? "remote_reported" : "unknown",
+        events: c.connected ? eventsConnected() : eventsNoAnswer(),
+        technicalResult: c.connected ? "connected" : "not_answered",
+        outcome: c.outcome,
+        outcomeSaved: !!c.outcome,
+        notes: `${DEMO_TAG} ${c.outcome || "no answer"}`,
+        ...(c.key === "today-lotus" ? {
+          aiStatus: "done",
+          transcript: "We run the scheme in a notebook. Collections are manual and reminders are missed.",
+          ai: {
+            summary: "Shop still tracks the gold scheme on paper and wants a branded app.",
+            objections: ["monthly fee"],
+            scriptAssessment: {
+              steps: [
+                { key: "introduction", label: "Warm introduction", status: "covered", quote: "branded app" },
+                { key: "discovery", label: "Discovery", status: "partial", quote: "notebook", missing: ["who collects cash"] },
+              ],
+            },
+            salesSignals: {
+              interest: "high",
+              interestQuote: "wants a branded app",
+              questions: [{ topic: "pricing", section: "pricing", quote: "monthly fee" }],
+              doubts: [{ section: "pricing", topic: "monthly fee", quote: "monthly fee" }],
+              interruptions: [],
+            },
+          },
+        } : {}),
+      },
+    },
+    { upsert: true }
+  );
+}
+const lotusCall = await Call.findOne({ clientId: "demo-seed-today-lotus" });
+if (lotusCall) {
+  await CoachingAction.findOneAndUpdate(
+    { call: lotusCall.id, step: "discovery" },
+    {
+      $set: {
+        agent: agent1.id,
+        manager: mgr.id,
+        excerpt: "We run the scheme in a notebook.",
+        improvement: "Ask who collects the cash and how often customers miss a month.",
+      },
+    },
+    { upsert: true }
+  );
+}
+
+for (const person of [agent1, agent2]) {
+  for (let back = 0; back < 5; back++) {
+    const key = istDay(daysAgo(back));
+    const open = back === 0;
+    await Attendance.findOneAndUpdate(
+      { agent: person.id, day: key },
+      { $set: { checkedInAt: atIst(key, 9, 28), checkedOutAt: open ? null : atIst(key, 18, 12) } },
+      { upsert: true }
+    );
+  }
+}
+
+const queueTasks = [
+  { key: "demo-seed-overdue-callback", lead: acme, owner: agent1, title: "Call ACME about the rate card", kind: "call", dueAt: hoursAgo(8), customerFacing: true },
+  { key: "demo-seed-overdue-demo-send", lead: leadsBySlug.lotus, owner: agent1, title: "Send Lotus Gold demo link", kind: "send_demo", dueAt: hoursAgo(5), customerFacing: true },
+  { key: "demo-seed-tomorrow-callback", lead: leadsBySlug.malabar, owner: agent1, title: "Malabar Pearl — decision callback", kind: "call", dueAt: atIst(istDay(hoursFromNow(26)), 11, 0), customerFacing: true, fixed: true },
+  { key: "demo-seed-tomorrow-quote", lead: leadsBySlug.amba, owner: agent2, title: "Send Amba two-branch quote", kind: "send_proposal", dueAt: atIst(istDay(hoursFromNow(26)), 16, 30), customerFacing: true },
+];
+for (const task of queueTasks) {
+  await Task.findOneAndUpdate(
+    { key: task.key },
+    {
+      $set: {
+        lead: task.lead.id,
+        owner: task.owner.id,
+        title: task.title,
+        kind: task.kind,
+        status: "open",
+        dueAt: task.dueAt,
+        originalDueAt: task.dueAt,
+        customerFacing: !!task.customerFacing,
+        fixed: !!task.fixed,
+      },
+    },
+    { upsert: true }
+  );
+}
+
+const soon = hoursFromNow(4);
+await Meeting.findOneAndUpdate(
+  { lead: leadsBySlug.kairali.id, place: "https://meet.example.com/kairali-confirm" },
+  {
+    $set: {
+      lead: leadsBySlug.kairali.id,
+      bookedBy: agent2.id,
+      reps: [agent2.id],
+      start: soon,
+      end: new Date(+soon + 40 * 60000),
+      type: "online",
+      placePending: false,
+      confirmed: false,
+      status: "scheduled",
+      outcome: null,
+      resultSaved: false,
+    },
+  },
+  { upsert: true }
+);
+const missedEnd = hoursAgo(3);
+await Meeting.findOneAndUpdate(
+  { lead: leadsBySlug.amba.id, place: "Amba Jewellery, Thrissur" },
+  {
+    $set: {
+      lead: leadsBySlug.amba.id,
+      bookedBy: agent2.id,
+      reps: [agent2.id],
+      start: hoursAgo(4),
+      end: missedEnd,
+      type: "physical",
+      confirmed: true,
+      status: "scheduled",
+      outcome: null,
+      resultSaved: false,
+    },
+  },
+  { upsert: true }
+);
+const tomorrowStart = atIst(istDay(hoursFromNow(26)), 15, 0);
+await Meeting.findOneAndUpdate(
+  { lead: leadsBySlug.lotus.id, place: "Lotus Gold showroom, Kochi" },
+  {
+    $set: {
+      lead: leadsBySlug.lotus.id,
+      bookedBy: agent1.id,
+      reps: [agent1.id],
+      start: tomorrowStart,
+      end: new Date(+tomorrowStart + 45 * 60000),
+      type: "physical",
+      confirmed: true,
+      status: "scheduled",
+      placePending: false,
+    },
+  },
+  { upsert: true }
+);
+
+let walked = await Demo.findOne({ token: "demoseed-walk-kairali" });
+if (!walked) {
+  walked = await Demo.create({
+    lead: leadsBySlug.kairali.id,
+    owner: agent2.id,
+    shopName: leadsBySlug.kairali.name,
+    modules: "Customer app, admin, reminders",
+    token: "demoseed-walk-kairali",
+    expiresAt: hoursFromNow(24 * 12),
+  });
+}
+await Demo.updateOne(
+  { _id: walked._id },
+  {
+    $set: {
+      status: "responded",
+      sentAt: hoursAgo(30),
+      sentBy: agent2.id,
+      firstExploredAt: hoursAgo(26),
+      walkthroughCompletedAt: hoursAgo(20),
+      customerResponse: "Asked for a quote after showing the admin.",
+      url: "https://demo.example.com/kairali",
+    },
+  }
+);
+
+for (const back of [1, 2, 3]) {
+  const key = istDay(daysAgo(back));
+  await Notification.findOneAndUpdate(
+    { key: `demo-seed:daily:${key}:${mgr.id}` },
+    {
+      $set: {
+        user: mgr.id,
+        title: `${agent1.name} · ${key}`,
+        category: "daily_report",
+        body: [
+          `Tomorrow’s commitments (2) · Open Live tomorrow in the manager portal`,
+          `Malabar Pearl — decision callback · ${leadsBySlug.malabar.name} · ${agent1.name}`,
+          `Confirmed meeting · ${leadsBySlug.lotus.name} · ${agent1.name}`,
+          ``,
+          `Overdue backlog (2)`,
+          `Call ACME about the rate card · ${acme.name} · ${agent1.name}`,
+          `Send Lotus Gold demo link · ${leadsBySlug.lotus.name} · ${agent1.name}`,
+          ``,
+          `4 outbound, 3 connected, 206s average connected. 2 new leads, 2 overdue actions. 1 meetings booked, 1 engaged demo follow-ups open. In 09:28, out 18:12.`,
+        ].join("\n"),
+      },
+    },
+    { upsert: true }
+  );
+}
 
 await sweep();
 await operationsSweep();

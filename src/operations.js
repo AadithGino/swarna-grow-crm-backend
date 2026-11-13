@@ -122,6 +122,9 @@ export async function operationsSweep(now = new Date()) {
         );
       }
     }
+    if (l.stage === "Nurture" && !l.pauseUntil && !(await Task.exists({ lead: l.id, status: "open", kind: "call" })))
+      await issue(`nurture-date:${l.id}`, "customer_next", "Nurture lead has no return date",
+        `${l.name}: choose a dated callback or close the lead`, { lead: l.id, owner: l.owner, severity: "critical" }, now);
     const open = await Task.find({ lead: l.id, status: "open" });
     const promisedMeeting = await Meeting.exists({
       lead: l.id,
@@ -129,7 +132,8 @@ export async function operationsSweep(now = new Date()) {
       end: { $gt: now },
     });
     const customerNext = open.some(customerTask);
-    if (activeLead(l) && !customerNext && !promisedMeeting) {
+    const retryReview = l.retryReviewAt || open.some(row => row.kind === "internal" && row.title === "Review unanswered lead");
+    if (activeLead(l) && !retryReview && !customerNext && !promisedMeeting) {
       const due = workSlot(l.pauseUntil > now ? l.pauseUntil : now);
       const guardTask = await task(
         l,
@@ -148,7 +152,7 @@ export async function operationsSweep(now = new Date()) {
         now
       );
     }
-    if (l.ultra && activeLead(l)) {
+    if (l.ultra && activeLead(l) && !retryReview) {
       const local = new Date(+now + 330 * 60000),
         day = local.toISOString().slice(0, 10),
         begin = new Date(day + "T00:00:00+05:30"),
@@ -176,6 +180,32 @@ export async function operationsSweep(now = new Date()) {
           { kind: "call", customerFacing: true }
         );
     }
+  }
+  for (const meeting of await Meeting.find({ status: "scheduled", end: { $gt: now } }).populate("lead", "name owner")) {
+    if (!meeting.lead) continue;
+    const unavailableReps = meeting.reps.filter(rep => unavailable(owners.get(String(rep)), meeting.start));
+    if (!meeting.reps.length || unavailableReps.length) {
+      await issue(`meeting-coverage:${meeting.id}`, "coverage", "Scheduled meeting needs coverage",
+        `${meeting.lead.name}: check attendees for the ${meeting.start?.toISOString() || "scheduled"} meeting`,
+        { lead: meeting.lead.id, meeting: meeting.id, owner: unavailableReps[0] || meeting.lead.owner, severity: "critical" }, now);
+      if (p.autoCoverage) for (const rep of unavailableReps) {
+        try { await queueCoverage(meeting.lead.id, rep, "Scheduled meeting needs an available attendee", now); }
+        catch (error) { await issue(`meeting-backup:${meeting.id}:${rep}`, "coverage",
+          "Choose a meeting replacement", error.message, { lead: meeting.lead.id, meeting: meeting.id, owner: rep }, now); }
+      }
+    }
+  }
+  for (const call of await Call.find({ technicalResult: "missed_incoming", lead: null, endedAt: { $ne: null } })) {
+    const returned = await Call.exists({ number: call.number, startedAt: { $gte: call.endedAt }, $or: [
+      { direction: "outgoing", "events.type": "DIALING" }, { answeredAt: { $gte: call.endedAt } },
+    ] });
+    if (!returned) await issue(`unlinked-missed:${call.id}`, "customer_next", "Unlinked missed inbound call",
+      `Match the inbound call from ${call.number} to a lead or return the call.`, { owner: call.agent, call: call.id }, now);
+  }
+  for (const call of await Call.find({ recordingStatus: "uploading", endedAt: { $lte: new Date(+now - 30 * 60000) } })) {
+    await issue(`recording-upload:${call.id}`, "delivery", "Call recording upload incomplete",
+      `Check recording sync on the phone for call ending ${call.endedAt.toISOString()}.`,
+      { owner: call.agent, call: call.id, lead: call.lead }, now);
   }
   for (const t of await Task.find({ status: "open" }).populate("lead")) {
     if (
@@ -425,11 +455,11 @@ export async function operationsSweep(now = new Date()) {
     );
   }
   for (const i of await Import.find({
-    status: { $in: ["pending", "failed", "needs_review"] },
+    $or: [{ status: { $in: ["pending", "failed", "needs_review", "processing"] } }, { status: "reviewed", reviewDecision: null }],
   })) {
     if (
       i.status === "failed" ||
-      i.status === "needs_review" ||
+      i.status === "needs_review" || i.status === "reviewed" ||
       now - i.createdAt > 15 * 60000
     )
       await issue(
@@ -444,10 +474,12 @@ export async function operationsSweep(now = new Date()) {
       );
   }
   for (const t of await Task.find({
-    key: /^meta:/, status: "open", dueAt: { $lte: now },
+    key: /^(meta|enquiry|import-review):/, status: "open", dueAt: { $lte: now },
   }).populate("lead", "name stage doNotContact")) {
     if (!t.lead || t.lead.doNotContact || ["Won", "Lost"].includes(t.lead.stage)) continue;
-    const enquiry = await Import.findOne({ externalId: t.key.slice(5), status: "done" });
+    const [kind, ref] = t.key.split(":", 2);
+    const enquiry = kind === "meta" ? await Import.findOne({ externalId: t.key.slice(5), status: "done" })
+      : /^[a-f0-9]{24}$/i.test(ref) && await Import.findById(ref);
     if (!enquiry?.sourceCreatedAt) continue;
     const attempted = await Call.exists({
       lead: t.lead.id,
@@ -459,7 +491,7 @@ export async function operationsSweep(now = new Date()) {
     if (!attempted) await issue(
       `enquiry-contact:${enquiry.id}`,
       "first_contact",
-      "Meta enquiry response overdue",
+      "Enquiry response overdue",
       `${t.lead.name} has no logged contact attempt since this enquiry`,
       { lead: t.lead.id, task: t.id, owner: t.owner, sourceImport: enquiry.id, severity: "critical" },
       now
@@ -468,7 +500,7 @@ export async function operationsSweep(now = new Date()) {
   const configured = !!process.env.META_PAGE_TOKEN;
   const meta = await Setting.findOne({ key: "metaCheck" });
   if (
-    process.env.META_FORM_IDS &&
+    (process.env.META_FORM_IDS || process.env.META_PAGE_ID || configured) &&
     (!configured ||
       !meta?.value?.ok ||
       now - new Date(meta.value.at) > 30 * 60000)
@@ -477,7 +509,8 @@ export async function operationsSweep(now = new Date()) {
       "meta-stale",
       "capture",
       "Meta reconciliation is stale or failed",
-      "Check the capture health panel; source enquiries may not be reaching CRM",
+      meta?.value?.missingForms?.length ? `Forms missing from reconciliation: ${meta.value.missingForms.join(", ")}` :
+      meta?.value?.discoveryError || "Check capture health; source enquiries may not be reaching CRM",
       { severity: "critical" },
       now
     );

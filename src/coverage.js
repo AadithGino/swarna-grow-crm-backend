@@ -74,6 +74,53 @@ export async function requestHandover({
   });
   return h;
 }
+export async function replaceMeetingRep(lead, from, user, target, session) {
+  for (const rep of [String(from), String(user)].filter(Boolean).sort()) {
+    await Setting.updateOne({ key: `calendar:${rep}` }, { $inc: { "value.version": 1 } }, { session });
+  }
+  for (const m of await Meeting.find({
+    lead,
+    reps: from,
+    status: "scheduled",
+    end: { $gt: new Date() },
+  }).session(session)) {
+    if (target.availability === "away" && (!target.awayUntil || target.awayUntil > m.start))
+      throw fail("The new rep is away at the meeting time", 409);
+    const start = new Date(+m.start - (m.travelMinutes || 0) * 60000),
+      end = new Date(+m.end + (m.travelMinutes || 0) * 60000);
+    const conflict = await Meeting.findOne({
+      _id: { $ne: m.id },
+      status: "scheduled",
+      reps: user,
+      start: { $lt: end },
+      $expr: {
+        $gt: [
+          {
+            $add: [
+              "$end",
+              { $multiply: [{ $ifNull: ["$travelMinutes", 0] }, 60000] },
+            ],
+          },
+          start,
+        ],
+      },
+    }).session(session);
+    if (conflict)
+      throw fail(
+        "Backup has a meeting/travel conflict. Reschedule or select another person",
+        409
+      );
+    m.reps = [
+      ...new Set(
+        m.reps.map((x) =>
+          String(x) === String(from) ? String(user) : String(x)
+        )
+      ),
+    ];
+    await m.save({ session });
+  }
+}
+
 export async function answerHandover(id, user, body) {
   if (!["accept", "reject"].includes(body.action))
     throw fail("Choose accept or reject");
@@ -149,58 +196,13 @@ export async function answerHandover(id, user, body) {
       ).length;
       if (load + incomingDue > currentTarget.capacity)
         throw fail("This handover would exceed the backup capacity", 409);
-      if (String(l.owner) !== String(h.from) && !tasks.length)
+      const scheduled = await Meeting.exists({
+        lead: l.id, reps: h.from, status: "scheduled", end: { $gt: new Date() },
+      }).session(session);
+      if (String(l.owner) !== String(h.from) && !tasks.length && !scheduled)
         throw fail("Assignment changed. Ask the manager to review", 409);
-      await Setting.updateOne(
-        { key: `calendar:${user}` },
-        { $inc: { "value.version": 1 } },
-        { session }
-      );
-      await Setting.updateOne(
-        { key: `calendar:${h.from}` },
-        { $inc: { "value.version": 1 } },
-        { session }
-      );
-      for (const m of await Meeting.find({
-        lead: l.id,
-        reps: h.from,
-        status: "scheduled",
-        end: { $gt: new Date() },
-      }).session(session)) {
-        if (!body.includeMeetings) throw fail("Confirm meeting attendance");
-        const start = new Date(+m.start - (m.travelMinutes || 0) * 60000),
-          end = new Date(+m.end + (m.travelMinutes || 0) * 60000);
-        const conflict = await Meeting.findOne({
-          _id: { $ne: m.id },
-          status: "scheduled",
-          reps: user,
-          start: { $lt: end },
-          $expr: {
-            $gt: [
-              {
-                $add: [
-                  "$end",
-                  { $multiply: [{ $ifNull: ["$travelMinutes", 0] }, 60000] },
-                ],
-              },
-              start,
-            ],
-          },
-        }).session(session);
-        if (conflict)
-          throw fail(
-            "Backup has a meeting/travel conflict. Reschedule or select another person",
-            409
-          );
-        m.reps = [
-          ...new Set(
-            m.reps.map((x) =>
-              String(x) === String(h.from) ? String(user) : String(x)
-            )
-          ),
-        ];
-        await m.save({ session });
-      }
+      if (scheduled && !body.includeMeetings) throw fail("Confirm meeting attendance");
+      if (body.includeMeetings) await replaceMeetingRep(l.id, h.from, user, currentTarget, session);
       if (String(l.owner) === String(h.from)) {
         l.owner = user;
         l.workflowRevision++;

@@ -36,6 +36,13 @@ export async function sweep() {
     stage: { $nin: ["Won", "Lost", "Nurture"] },
     doNotContact: { $ne: true },
   })) {
+    if (l.retryReviewAt) continue;
+    const legacyReview = await Task.findOne({ lead: l.id, status: "open", kind: "internal", title: "Review unanswered lead" })
+      .select("createdAt");
+    if (legacyReview) {
+      await Lead.updateOne({ _id: l.id, retryReviewAt: null }, { $set: { retryReviewAt: legacyReview.createdAt || now } });
+      continue;
+    }
     if (
       l.ultra &&
       weekday !== 0 &&

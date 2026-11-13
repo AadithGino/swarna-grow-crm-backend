@@ -1,3 +1,8 @@
+import managerWorkspace from "./managerWorkspace.js";
+import callReview from "./callReview.js";
+import managerActions from "./managerActions.js";
+import management from "./management.js";
+import { fileURLToPath } from "node:url";
 import { pitchSteps, pitchVersion } from "./pitchRubric.js";
 import { managerMonitoring } from "./managerMonitoring.js";
 import {
@@ -6,7 +11,7 @@ import {
   completeMeetingOutcome,
 } from "./salesOutcome.js";
 import operationsRoutes from "./operationsRoutes.js";
-import { initializeLead } from "./coverage.js";
+import { initializeLead, replaceMeetingRep } from "./coverage.js";
 import { initializeDemo, advanceDemo } from "./demoFlow.js";
 import { changeTask } from "./taskChanges.js";
 import { healthSnapshot } from "./health.js";
@@ -45,6 +50,7 @@ import { deepTranscriptInsights } from "./transcriptAnalysis.js";
 import { localLeadOverview, synthesizeLeadOverview } from "./leadOverview.js";
 import { task, log, sweep } from "./workflow.js";
 import { presign, completeUpload, playback } from "./storage.js";
+import { policy, addWorkMinutes } from "./policy.js";
 import { ingestMeta } from "./meta.js";
 export const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -62,6 +68,7 @@ const wrap = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 const fail = (m, status = 400) => Object.assign(new Error(m), { status });
 const id = (v) => mongoose.isValidObjectId(v);
+app.use("/portal", express.static(fileURLToPath(new URL("../public/portal/", import.meta.url))));
 app.get("/health", (q, s) =>
   s.json({ ok: true, database: mongoose.connection.readyState === 1 })
 );
@@ -123,7 +130,7 @@ app.post(
         if (c.field === "leadgen")
           await Import.updateOne(
             { externalId: c.value.leadgen_id },
-            { $setOnInsert: { status: "pending", payload: c.value } },
+            { $setOnInsert: { status: "pending", payload: c.value }, $set: { webhookAt: new Date(), ...(c.value.form_id ? { formId: c.value.form_id } : {}) } },
             { upsert: true }
           );
     s.sendStatus(200);
@@ -208,6 +215,10 @@ const manager = (q, s, next) =>
     ? next()
     : next(fail("Manager access required", 403));
 app.use(operationsRoutes);
+app.use(management);
+app.use(managerActions);
+app.use(callReview);
+app.use(managerWorkspace);
 async function leadFor(q, leadId, { write = false } = {}) {
   if (!id(leadId)) throw fail("Invalid lead");
   const l = await Lead.findById(leadId);
@@ -299,11 +310,13 @@ app.get(
         ],
       };
     }
-    const leads = await Lead.find(filter)
-      .populate("owner", "name")
-      .sort({ ultra: -1, updatedAt: -1 })
-      .limit(500)
-      .lean();
+    const page = Number(q.query.page);
+    const paged = Number.isInteger(page) && page >= 1;
+    const pageSize = Math.min(50, Math.max(10, Number(q.query.pageSize) || 20));
+    const query = Lead.find(filter).populate("owner", "name").sort({ ultra: -1, updatedAt: -1 });
+    const [total, leads] = paged
+      ? await Promise.all([Lead.countDocuments(filter), query.skip((page - 1) * pageSize).limit(pageSize).lean()])
+      : [0, await query.limit(500).lean()];
     const tasks = await Task.find({ lead: { $in: leads.map(lead => lead._id) }, status: "open" })
       .select("lead title dueAt")
       .sort({ dueAt: 1 })
@@ -311,7 +324,8 @@ app.get(
     const nextByLead = new Map();
     for (const task of tasks)
       if (!nextByLead.has(String(task.lead))) nextByLead.set(String(task.lead), task);
-    s.json(leads.map(lead => ({ ...lead, nextTask: nextByLead.get(String(lead._id)) })));
+    const items = leads.map(lead => ({ ...lead, nextTask: nextByLead.get(String(lead._id)) }));
+    s.json(paged ? { items, total, page, pageSize } : items);
   })
 );
 app.post(
@@ -320,32 +334,44 @@ app.post(
     const { name, source, location } = q.body;
     if (!name) throw fail("Shop/contact name required");
     const p = phone(q.body.phone);
-    let existing = await Lead.findOne({ phone: p });
-    if (existing) {
-      if (q.user.role !== "manager" && String(existing.owner) !== q.user.id)
-        throw fail(
-          "This phone already belongs to another assigned lead; ask your manager",
-          409
-        );
-      return s.status(200).json({ ...existing.toObject(), duplicate: true });
-    }
-    const owner =
-      q.user.role === "manager" && id(q.body.owner) ? q.body.owner : q.user.id;
-    if (!(await User.exists({ _id: owner, active: true })))
-      throw fail("Assign an active lead owner");
-    const l = await Lead.create({
-      name,
-      phone: p,
-      source: source || "Manual",
-      location,
-      owner,
-    });
-    await initializeLead(l);
-    await task(l, "First contact", workSlot(new Date()), `first:${l.id}`, {
-      kind: "call",
-    });
-    await log(l, q.user.id, "created", "Lead created");
-    s.status(201).json(await Lead.findById(l.id));
+    if (q.body.requestId != null && !/^[\w-]{1,128}$/.test(q.body.requestId))
+      throw fail("Invalid enquiry request ID", 422);
+    const now = new Date();
+    const dueAt = addWorkMinutes(now, (await policy()).firstContactMinutes);
+    const externalId = `manual:${q.user.id}:${q.body.requestId || crypto.randomUUID()}`;
+    const session = await mongoose.startSession();
+    let enquiry, lead, created;
+    try {
+      await session.withTransaction(async () => {
+        created = false;
+        enquiry = await Import.findOne({ externalId }).session(session);
+        if (enquiry) {
+          if (enquiry.payload?.phone !== p) throw fail("This request was used for another lead", 409);
+          lead = await Lead.findById(enquiry.lead).session(session);
+          return;
+        }
+        lead = await Lead.findOne({ phone: p }).session(session);
+        if (!lead) {
+          const owner = q.user.role === "manager" && id(q.body.owner) ? q.body.owner : q.user.id;
+          if (!(await User.exists({ _id: owner, active: true }).session(session))) throw fail("Assign an active lead owner");
+          [lead] = await Lead.create([{ name, phone: p, source: source || "Manual", location, owner,
+            firstContactDueAt: dueAt }], { session });
+          created = true;
+        } else {
+          await Lead.updateOne({ _id: lead.id }, { $inc: { workflowRevision: 1 } }, { session });
+        }
+        const review = lead.doNotContact || ["Lost", "Won"].includes(lead.stage) || !lead.owner;
+        [enquiry] = await Import.create([{ externalId, source: "manual", sourceCreatedAt: now, lead: lead.id,
+          status: review ? "needs_review" : "done", payload: { name, source: source || "Manual", location, phone: p } }], { session });
+        if (!review) await Task.create([{ key: `enquiry:${enquiry.id}`, lead: lead.id, owner: lead.owner,
+          kind: "call", title: created ? "First contact" : "Contact repeat enquiry",
+          dueAt, originalDueAt: dueAt, customerFacing: true }], { session });
+        if (created) await Activity.create([{ lead: lead.id, actor: q.user.id, type: "created", text: "Lead created" }], { session });
+      });
+    } finally { await session.endSession(); }
+    const canView = lead && (q.user.role === "manager" || String(lead.owner) === q.user.id);
+    s.status(created ? 201 : 200).json({ ...(canView ? lead.toObject() : {}),
+      ...(!created ? { duplicate: true } : {}), enquiry: enquiry.id, needsReview: enquiry.status === "needs_review" });
   })
 );
 app.post(
@@ -451,6 +477,12 @@ app.patch(
         throw fail("Give a priority reason");
       l.ultra = !!q.body.ultra;
     }
+    const nurtureChange = q.body.stage === "Nurture" && (l.stage !== "Nurture" || !l.pauseUntil ||
+      (q.body.pauseUntil !== undefined && +new Date(q.body.pauseUntil) !== +l.pauseUntil));
+    const nurtureAt = nurtureChange ? new Date(q.body.pauseUntil) : null;
+    if (nurtureChange && (!q.body.pauseUntil || !Number.isFinite(+nurtureAt) || nurtureAt <= new Date()))
+      throw fail("Choose a future Nurture callback date", 422);
+    if (nurtureChange) l.pauseUntil = nurtureAt;
     if (q.body.stage) {
       if (
         q.body.stage === "Won" &&
@@ -464,45 +496,67 @@ app.patch(
     }
     if (q.body.doNotContact !== undefined)
       l.doNotContact = !!q.body.doNotContact;
-    if (q.body.owner && q.user.role === "manager") {
-      if (!["transfer", "retain"].includes(q.body.taskTransfer))
-        throw fail("Choose transfer or retain unfinished tasks");
-      if (!(await User.exists({ _id: q.body.owner, active: true })))
-        throw fail("Owner not found");
-      l.owner = q.body.owner;
-      if (q.body.taskTransfer === "transfer")
-        await Task.updateMany(
-          { lead: l.id, status: "open" },
-          { $set: { owner: l.owner } }
-        );
-    }
-    await l.save();
-    if (l.doNotContact || ["Won", "Lost"].includes(l.stage)) {
-      await Task.updateMany(
-        { lead: l.id, status: "open" },
-        { $set: { status: "cancelled" } }
-      );
-      await Meeting.updateMany(
-        { lead: l.id, status: "scheduled" },
-        { $set: { status: "cancelled" } }
-      );
-    } else if (activeLead(l) && !(await Task.exists({ lead: l.id, status: "open" })))
-      await task(
-        l,
-        l.stage === "New" ? "First contact" : "Follow up",
-        workSlot(new Date()),
-        `reopen:${l.id}:${l.stage}`,
-        { kind: "call" }
-      );
+    if (q.body.expectedRevision && +new Date(q.body.expectedRevision) !== +l.updatedAt)
+      throw fail("Lead changed. Refresh before saving", 409);
+    const from = l.owner;
+    const transferring = q.body.owner && q.user.role === "manager" && String(from) !== String(q.body.owner);
+    if (transferring && (!id(q.body.owner) || !["transfer", "retain"].includes(q.body.taskTransfer)))
+      throw fail("Choose an active owner and whether to transfer open work");
+    if (transferring && q.body.meetingTransfer === "replace" && from)
+      await ensureCalendarLocks({ reps: [String(from), q.body.owner] });
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const current = await Lead.findById(l.id).session(session);
+        if (!current || +current.updatedAt !== +l.updatedAt)
+          throw fail("Lead changed. Refresh before saving", 409);
+        if (transferring) {
+          const target = await User.findOne({ _id: q.body.owner, active: true }).session(session);
+          if (!target) throw fail("Owner not found");
+          const meetings = from && await Meeting.exists({
+            lead: l.id, reps: from, status: "scheduled", end: { $gt: new Date() },
+          }).session(session);
+          if (meetings && !["keep", "replace"].includes(q.body.meetingTransfer))
+            throw fail("Choose who will attend the scheduled meetings", 422);
+          if (meetings && q.body.meetingTransfer === "replace") {
+            await replaceMeetingRep(l.id, from, target.id, target, session);
+            await Task.updateMany({ lead: l.id, owner: from, status: "open", key: /^meeting-(prep|place):/ },
+              { $set: { owner: target.id } }, { session });
+          }
+          l.owner = target.id;
+          l.workflowRevision = current.workflowRevision + 1;
+          if (q.body.taskTransfer === "transfer") {
+            await Task.updateMany({ lead: l.id, owner: from || null, status: "open", key: { $not: /^meeting-(prep|place):/ } },
+              { $set: { owner: target.id } }, { session });
+            await Demo.updateMany({ lead: l.id, owner: from || null, status: { $nin: ["responded", "cancelled"] } },
+              { $set: { owner: target.id } }, { session });
+          }
+        }
+        // Use a fresh document on each transaction retry.
+        current.set(l.getChanges().$set || {});
+        for (const field of Object.keys(l.getChanges().$unset || {})) current.set(field, undefined);
+        await current.save({ session });
+        await Activity.create([{ lead: current.id, actor: q.user.id, type: "updated", text: "Lead updated",
+          data: transferring ? { from, to: current.owner, taskTransfer: q.body.taskTransfer, meetingTransfer: q.body.meetingTransfer } : q.body }], { session });
+        if (nurtureChange && !current.doNotContact) {
+          const key = `nurture:${current.id}:${+nurtureAt}`;
+          await Task.updateMany({ lead: current.id, status: "open", key: { $regex: /^nurture:/, $ne: key } },
+            { $set: { status: "cancelled" } }, { session });
+          await Task.updateOne({ key }, { $set: { lead: current.id, owner: current.owner, title: "Nurture callback",
+            kind: "call", status: "open", dueAt: nurtureAt, originalDueAt: nurtureAt, fixed: true, customerFacing: true } },
+            { session, upsert: true });
+        }
+        if (l.doNotContact || ["Won", "Lost"].includes(l.stage)) {
+          await Task.updateMany({ lead: l.id, status: "open" }, { $set: { status: "cancelled" } }, { session });
+          await Meeting.updateMany({ lead: l.id, status: "scheduled" }, { $set: { status: "cancelled" } }, { session });
+        }
+      });
+    } finally { await session.endSession(); }
+    if (!l.doNotContact && activeLead(l) && !(await Task.exists({ lead: l.id, status: "open" })))
+      await task(l, l.stage === "New" ? "First contact" : "Follow up", workSlot(new Date()),
+        `reopen:${l.id}:${l.stage}`, { kind: "call" });
     if (l.stage === "Won")
-      await task(
-        l,
-        "Onboard customer",
-        workSlot(new Date()),
-        `onboard:${l.id}`,
-        { kind: "onboarding" }
-      );
-    await log(l, q.user.id, "updated", "Lead updated", q.body);
+      await task(l, "Onboard customer", workSlot(new Date()), `onboard:${l.id}`, { kind: "onboarding" });
     await sweep();
     s.json(l);
   })
@@ -560,6 +614,7 @@ app.post(
       }
       const lead = await Lead.findOne({ phone: normalized, ...leadScope(q) });
       const allowed = {
+        ...(!existing && lead?.owner ? { leadOwnerAtCall: lead.owner } : {}),
         agent: q.user.id,
         lead: existing?.lead || lead?._id,
         number: normalized,
@@ -713,11 +768,11 @@ app.post(
   "/calls/:id/lead",
   wrap(async (q, s) => {
     const c = await callFor(q, q.params.id);
-    const l = await leadFor(q, q.body.lead);
+    const l = await leadFor(q, q.body.lead, { write: true });
     if (l.phone !== c.number) throw fail("Lead phone does not match call");
     c.lead = l.id;
     await c.save();
-    s.json(c);
+    s.json((await applyAutomaticOutcome(c.id)) || c);
   })
 );
 app.post(
@@ -793,7 +848,7 @@ app.post(
     try {
       await session.withTransaction(async () => {
         const current = await Lead.findById(l.id).session(session);
-        meeting = await bookMeeting(current, b, session);
+        meeting = await bookMeeting(current, b, session, undefined, q.user.id);
       });
     } finally {
       await session.endSession();
@@ -989,22 +1044,39 @@ app.post(
   "/proposals",
   wrap(async (q, s) => {
     const l = await leadFor(q, q.body.lead);
-    if (!(Number(q.body.amount) > 0))
-      throw fail("Positive proposal amount required");
-    const p = await Proposal.create({
-      lead: l.id,
-      owner: q.user.id,
-      amount: q.body.amount,
-      url: q.body.url,
-      version: (await Proposal.countDocuments({ lead: l.id })) + 1,
-    });
-    await task(
-      l,
-      "Send proposal",
-      workSlot(new Date()),
-      `proposal-send:${p.id}`,
-      { kind: "proposal" }
-    );
+    const hasSplit = q.body.setupFee != null || q.body.monthlyFee != null;
+    const setupFee = Number(q.body.setupFee ?? 0), monthlyFee = Number(q.body.monthlyFee ?? 0);
+    const amount = hasSplit ? setupFee + monthlyFee : Number(q.body.amount);
+    if (!Number.isFinite(amount) || amount <= 0 || (hasSplit && (setupFee < 0 || monthlyFee < 0)))
+      throw fail("Enter valid setup and monthly fees");
+    const demoQuoteTask = { lead: l.id, status: "open", kind: "send_proposal", key: /^demo-response-next:/ };
+    if (q.body.sourceTask && !id(q.body.sourceTask)) throw fail("Invalid demo quote task", 422);
+    const candidates = await Task.find(q.body.sourceTask
+      ? { ...demoQuoteTask, _id: q.body.sourceTask } : demoQuoteTask).limit(2);
+    if ((q.body.sourceTask && !candidates.length) || candidates.length > 1)
+      throw fail("Open the specific demo quote task before creating the quote", 409);
+    const session = await mongoose.startSession();
+    let p;
+    try {
+      await session.withTransaction(async () => {
+        const sourceTask = candidates[0] && await Task.findOne({ ...demoQuoteTask, _id: candidates[0].id }).session(session);
+        if (candidates.length && !sourceTask) throw fail("Demo quote task changed. Refresh and retry.", 409);
+        if (sourceTask) {
+          await Task.updateOne({ _id: sourceTask.id }, { $set: { updatedAt: new Date() } }, { session });
+          p = await Proposal.findOne({ sourceTask: sourceTask.id, sentAt: null }).session(session);
+          if (p) return;
+        }
+        [p] = await Proposal.create([{
+          lead: l.id, owner: q.user.id, amount, ...(hasSplit ? { setupFee, monthlyFee } : {}),
+          url: q.body.url, sourceTask: sourceTask?._id,
+          version: (await Proposal.countDocuments({ lead: l.id }).session(session)) + 1,
+        }], { session });
+        await Task.create([{
+          lead: l.id, owner: sourceTask?.owner || l.owner, title: "Send proposal", kind: "proposal",
+          key: `proposal-send:${p.id}`, dueAt: sourceTask?.dueAt || workSlot(new Date()),
+        }], { session });
+      });
+    } finally { await session.endSession(); }
     s.json(p);
   })
 );
@@ -1028,17 +1100,26 @@ app.post(
         if (proposal.status === "sent" &&
             await Task.exists({ key: `proposal-follow:${proposal.id}` }).session(session))
           return;
+        // Old drafts can be linked at send time when there is exactly one outstanding demo quote.
+        const sourceQuery = { lead: lead.id, kind: "send_proposal", key: /^demo-response-next:/, status: "open" };
+        const sources = await Task.find(proposal.sourceTask
+          ? { ...sourceQuery, _id: proposal.sourceTask } : sourceQuery).limit(2).session(session);
+        if (sources.length > 1) throw fail("Create the quote from the specific demo task", 409);
+        if (proposal.sourceTask && !sources.length && proposal.status !== "sent")
+          throw fail("The originating demo task is no longer open", 409);
+        const source = sources[0];
+        if (source) proposal.sourceTask = source._id;
         const sentAt = proposal.sentAt || new Date();
         await Task.updateOne(
           { key: `proposal-follow:${proposal.id}` },
           { $setOnInsert: {
-            lead: lead.id, owner: lead.owner, title: "Discuss proposal decision",
+            lead: lead.id, owner: source?.owner || lead.owner, title: "Discuss proposal decision",
             kind: "call", dueAt, originalDueAt: dueAt, customerFacing: true, fixed: true,
           } },
           { upsert: true, session }
         );
-        await Task.updateOne(
-          { key: `proposal-send:${proposal.id}`, status: "open" },
+        await Task.updateMany(
+          { $or: [{ key: `proposal-send:${proposal.id}` }, ...(source ? [{ _id: source.id }] : [])], status: "open" },
           { $set: { status: "done", doneAt: sentAt } }, { session }
         );
         proposal.status = "sent";

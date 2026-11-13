@@ -1,7 +1,7 @@
-import { Import, Lead, User, Setting } from "./models.js";
+import crypto from "node:crypto";
+import mongoose from "mongoose";
+import { Import, Lead, User, Setting, Task } from "./models.js";
 import { phone } from "./rules.js";
-import { task } from "./workflow.js";
-import { initializeLead } from "./coverage.js";
 import { unavailable, policy, addWorkMinutes } from "./policy.js";
 export async function graph(path) {
   const r = await fetch(
@@ -33,66 +33,49 @@ export async function ingestMeta(fetchGraph = graph, now = new Date()) {
   }
   // Keep imports pending when nobody can own them. The operations sweep escalates it.
   if (!owner) return;
-  for (const item of await Import.find({
-    source: { $ne: "csv" },
-    status: { $in: ["pending", "failed"] },
-    $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: now } }],
-  })
-    .sort({ nextAttemptAt: 1, createdAt: 1 })
-    .limit(30)) {
+  const eligible = { source: { $nin: ["csv", "manual"] },
+    status: { $in: ["pending", "failed", "processing"] },
+    $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: now } }] };
+  for (const candidate of await Import.find(eligible).sort({ nextAttemptAt: 1, createdAt: 1 }).limit(30)) {
+    const processingToken = crypto.randomUUID();
+    const item = await Import.findOneAndUpdate({ ...eligible, _id: candidate.id }, {
+      $set: { status: "processing", processingToken, nextAttemptAt: new Date(Date.now() + 120000) },
+      $inc: { attempts: 1 },
+    }, { new: true });
+    if (!item) continue;
+    const claim = { _id: item.id, status: "processing", processingToken };
     try {
-      const d = await fetchGraph(
-          `${item.externalId}?fields=id,created_time,field_data,ad_id,form_id`
-        ),
-        fields = Object.fromEntries(
-          (d.field_data || []).map((x) => [x.name, x.values?.[0]])
-        ),
-        p = phone(fields.phone_number);
+      const d = await fetchGraph(`${item.externalId}?fields=id,created_time,field_data,ad_id,form_id`);
+      const fields = Object.fromEntries((d.field_data || []).map(x => [x.name, x.values?.[0]]));
+      const p = phone(fields.phone_number);
       const sourceCreatedAt = new Date(d.created_time);
-      const enquiryAt = Number.isFinite(+sourceCreatedAt) && sourceCreatedAt <= now
-        ? sourceCreatedAt : now;
+      const enquiryAt = Number.isFinite(+sourceCreatedAt) && sourceCreatedAt <= now ? sourceCreatedAt : now;
       const dueAt = addWorkMinutes(enquiryAt, (await policy()).firstContactMinutes);
-      const l = await Lead.findOneAndUpdate(
-        { phone: p },
-        {
-          $setOnInsert: {
-            name: fields.company_name || fields.full_name || p,
-            phone: p,
-            owner: owner.id,
-            source: "Meta",
-            firstContactDueAt: dueAt,
-            attribution: { adId: d.ad_id, formId: d.form_id, externalId: d.id },
-          },
-        },
-        { upsert: true, new: true }
-      );
-      await initializeLead(l, now);
-      if (!l.doNotContact && !["Won", "Lost"].includes(l.stage))
-        await task(
-          l,
-          "Contact Meta enquiry",
-          dueAt,
-          `meta:${d.id}`,
-          { kind: "call", customerFacing: true }
-        );
-      item.lead = l.id;
-      item.formId = d.form_id;
-      item.sourceCreatedAt = enquiryAt;
-      item.status =
-        l.doNotContact || ["Won", "Lost"].includes(l.stage)
-          ? "needs_review"
-          : "done";
-      item.error = undefined;
-      item.nextAttemptAt = undefined;
+      const session = await mongoose.startSession();
+      try {
+        await session.withTransaction(async () => {
+          const current = await Import.findOne(claim).session(session);
+          if (!current) return;
+          const lead = await Lead.findOneAndUpdate({ phone: p }, {
+            $setOnInsert: { name: fields.company_name || fields.full_name || p, phone: p, owner: owner.id,
+              source: "Meta", firstContactDueAt: dueAt, attribution: { adId: d.ad_id, formId: d.form_id, externalId: item.externalId } },
+          }, { upsert: true, new: true, session });
+          await Lead.updateOne({ _id: lead.id }, { $inc: { workflowRevision: 1 } }, { session });
+          const review = lead.doNotContact || ["Won", "Lost"].includes(lead.stage) || !lead.owner;
+          if (!review) await Task.updateOne({ key: `meta:${item.externalId}` }, { $setOnInsert: {
+            lead: lead.id, owner: lead.owner, title: "Contact Meta enquiry", dueAt, originalDueAt: dueAt,
+            kind: "call", customerFacing: true,
+          } }, { upsert: true, session });
+          await Import.updateOne(claim, { $set: { lead: lead.id, formId: d.form_id || current.formId,
+            sourceCreatedAt: enquiryAt, status: review ? "needs_review" : "done" },
+            $unset: { processingToken: 1, nextAttemptAt: 1, error: 1 } }, { session });
+        });
+      } finally { await session.endSession(); }
     } catch (e) {
-      item.status = "failed";
-      item.error = e.message;
-      item.nextAttemptAt = new Date(
-        +now + Math.min(1440, 2 ** Math.min(item.attempts || 0, 11)) * 60000
-      );
+      await Import.updateOne(claim, { $set: { status: "failed", error: e.message,
+        nextAttemptAt: new Date(+now + Math.min(1440, 2 ** Math.min(item.attempts - 1, 11)) * 60000) },
+        $unset: { processingToken: 1 } });
     }
-    item.attempts = (item.attempts || 0) + 1;
-    await item.save();
   }
 }
 export async function reconcileMeta(fetchGraph = graph, now = new Date()) {
@@ -160,7 +143,7 @@ export async function reconcileMeta(fetchGraph = graph, now = new Date()) {
       const linked = captured.filter(
           (i) => i.status === "done" && i.lead
         ).length,
-        reviewed = captured.filter((i) => i.status === "reviewed").length,
+        reviewed = captured.filter((i) => i.status === "reviewed" && i.reviewDecision).length,
         queued = seen.size - linked - reviewed;
       const value = {
         at: now,
@@ -186,13 +169,38 @@ export async function reconcileMeta(fetchGraph = graph, now = new Date()) {
       results.push({ form, ...value });
     }
   }
+  const discovered = new Set(await Import.distinct("formId", {
+    source: "meta", formId: { $type: "string" }, webhookAt: { $gte: new Date(+now - 30 * 86400000) },
+  }));
+  let discoveryError;
+  if (process.env.META_PAGE_ID) {
+    try {
+      let after, complete = false;
+      for (let page = 0; page < 100; page++) {
+        const result = await fetchGraph(`${process.env.META_PAGE_ID}/leadgen_forms?fields=id,status&limit=100${after ? "&after=" + encodeURIComponent(after) : ""}`);
+        for (const form of result.data || []) if (form.status === "ACTIVE") discovered.add(form.id);
+        if (!result.paging?.next) { complete = true; break; }
+        const next = result.paging?.cursors?.after;
+        if (!next || next === after) throw Error("Meta form discovery cursor stalled");
+        after = next;
+      }
+      if (!complete) throw Error("Meta form discovery did not finish");
+    } catch (error) { discoveryError = error.message; }
+  }
+  const missingForms = [...discovered].filter(form => !forms.includes(form));
+  for (const result of results) {
+    const verified = await Import.findOne({ formId: result.form, status: "done", webhookAt: { $ne: null } })
+      .select("webhookAt").sort({ webhookAt: -1 });
+    result.lastVerifiedCaptureAt = verified?.webhookAt || null;
+  }
   await Setting.updateOne(
     { key: "metaCheck" },
     {
       $set: {
         value: {
           at: now,
-          ok: forms.length > 0 && results.every((x) => x.ok),
+          ok: forms.length > 0 && !missingForms.length && !discoveryError && results.every((x) => x.ok),
+          missingForms, discoveryError,
           forms: results,
         },
       },

@@ -102,7 +102,7 @@ async function insertTask(
     { upsert: true, session }
   );
 }
-export async function bookMeeting(lead, b, session, sourceCall) {
+export async function bookMeeting(lead, b, session, sourceCall, bookedBy) {
   if (lead.doNotContact || ["Won", "Lost"].includes(lead.stage))
     throw reject("Reopen the lead before booking a meeting.");
   for (const rep of [...b.reps].sort())
@@ -133,7 +133,7 @@ export async function bookMeeting(lead, b, session, sourceCall) {
       409
     );
   const [m] = await Meeting.create(
-    [{ lead: lead._id, ...b, ...(sourceCall ? { sourceCall } : {}) }],
+    [{ lead: lead._id, ...b, bookedBy, ...(sourceCall ? { sourceCall } : {}) }],
     { session }
   );
   await Lead.updateOne(

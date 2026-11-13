@@ -1,4 +1,5 @@
 import { notify } from "./notifications.js";
+import mongoose from "mongoose";
 import express from "express";
 import {
   User,
@@ -11,7 +12,7 @@ import {
   Setting,
   Import,
 } from "./models.js";
-import { policy, defaults } from "./policy.js";
+import { policy, defaults, addWorkMinutes } from "./policy.js";
 import { requestHandover, answerHandover, suggestBackup } from "./coverage.js";
 import { healthSnapshot } from "./health.js";
 const router = express.Router(),
@@ -267,12 +268,12 @@ router.get(
       policy: await policy(),
       capture: (await Setting.findOne({ key: "metaCheck" }))?.value || null,
       failedImports: await Import.find({
-        status: { $in: ["failed", "needs_review"] },
+        $or: [{ status: { $in: ["failed", "needs_review"] } }, { status: "reviewed", reviewDecision: null }],
       })
         .sort({ updatedAt: -1 })
         .limit(10),
       pendingImports: await Import.countDocuments({
-        status: { $in: ["pending", "failed", "needs_review"] },
+        $or: [{ status: { $in: ["pending", "failed", "needs_review"] } }, { status: "reviewed", reviewDecision: null }],
       }),
     });
   })
@@ -301,19 +302,51 @@ router.patch(
     s.json(await policy());
   })
 );
+router.get("/imports/:id/review", manager, wrap(async (q, s) => {
+  const item = await Import.findById(q.params.id);
+  if (!item) throw fail("Import not found", 404);
+  const p = await policy();
+  s.json({ dueAt: addWorkMinutes(item.sourceCreatedAt || item.createdAt, p.firstContactMinutes) });
+}));
 router.post(
   "/imports/:id/review",
   manager,
   wrap(async (q, s) => {
-    if (!q.body.reason?.trim())
-      throw fail("Record the capture review decision");
-    const i = await Import.findById(q.params.id);
-    if (!i) throw fail("Import not found", 404);
-    i.status = "reviewed";
-    i.reviewedAt = new Date();
-    i.reviewReason = q.body.reason;
-    await i.save();
-    s.json(i);
+    const { decision, lead: leadId, reason } = q.body;
+    if (!["link_existing", "invalid", "do_not_contact"].includes(decision) || !String(reason || "").trim())
+      throw fail("Choose a review decision and record the reason");
+    const p = await policy();
+    const session = await mongoose.startSession();
+    let i, commitment;
+    try {
+      await session.withTransaction(async () => {
+        i = await Import.findById(q.params.id).session(session);
+        if (!i) throw fail("Import not found", 404);
+        if (!["failed", "needs_review", "reviewed"].includes(i.status) || (i.status === "reviewed" && i.reviewDecision))
+          throw fail("This import has already changed. Refresh before reviewing.", 409);
+        if (decision === "link_existing") {
+          if (!mongoose.isValidObjectId(leadId)) throw fail("Choose the existing lead");
+          const lead = await Lead.findById(leadId).populate("owner", "name active").session(session);
+          if (!lead || !lead.owner?.active || lead.doNotContact || ["Won", "Lost"].includes(lead.stage))
+            throw fail("Choose an open lead with an active owner and permission to contact");
+          await Lead.updateOne({ _id: lead.id }, { $inc: { workflowRevision: 1 } }, { session });
+          const dueAt = addWorkMinutes(i.sourceCreatedAt || i.createdAt, p.firstContactMinutes);
+          const key = `import-review:${i.id}`;
+          await Task.updateOne({ key }, { $setOnInsert: { lead: lead.id, owner: lead.owner.id,
+            key, title: "Contact reviewed enquiry", dueAt, originalDueAt: dueAt, kind: "call", customerFacing: true } },
+            { upsert: true, session });
+          i.lead = lead.id;
+          commitment = { owner: lead.owner.name, dueAt };
+        }
+        i.status = "reviewed";
+        i.reviewDecision = decision;
+        i.reviewedAt = new Date();
+        i.reviewedBy = q.user.id;
+        i.reviewReason = String(reason).trim().slice(0, 1000);
+        await i.save({ session });
+      });
+    } finally { await session.endSession(); }
+    s.json({ ...i.toObject(), commitment });
   })
 );
 router.post(
@@ -322,14 +355,15 @@ router.post(
   wrap(async (q, s) => {
     const i = await Import.findById(q.params.id);
     if (!i) throw fail("Import not found", 404);
-    if (i.source === "csv")
+    if (["csv", "manual"].includes(i.source))
       throw fail(
-        "Correct and reimport the CSV row, then record the review decision for this failed row"
+        "Correct the enquiry details and record a review decision"
       );
-    i.status = "pending";
-    i.nextAttemptAt = new Date();
-    await i.save();
-    s.json(i);
+    const updated = await Import.findOneAndUpdate({ _id: i.id,
+      $or: [{ status: { $in: ["failed", "needs_review"] } }, { status: "reviewed", reviewDecision: null }] },
+      { $set: { status: "pending", nextAttemptAt: new Date() } }, { new: true });
+    if (!updated) throw fail("This import is already handled or queued", 409);
+    s.json(updated);
   })
 );
 export default router;
