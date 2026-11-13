@@ -51,10 +51,15 @@ import { localLeadOverview, synthesizeLeadOverview } from "./leadOverview.js";
 import { task, log, sweep } from "./workflow.js";
 import { presign, completeUpload, playback } from "./storage.js";
 import { policy, addWorkMinutes } from "./policy.js";
-import { ingestMeta } from "./meta.js";
+import { ingestMeta, ingestMetaLead } from "./meta.js";
 export const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ origin: process.env.CORS_ORIGIN?.split(",") || false }));
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN?.split(",").map((o) => o.trim()).filter(Boolean) || true,
+    credentials: true,
+  })
+);
 app.use(
   express.json({
     limit: "2mb",
@@ -127,12 +132,26 @@ app.post(
       throw fail("Invalid signature", 403);
     for (const e of q.body.entry || [])
       for (const c of e.changes || [])
-        if (c.field === "leadgen")
+        if (c.field === "leadgen") {
+          const leadgenId = c.value?.leadgen_id;
+          if (!leadgenId) continue;
           await Import.updateOne(
-            { externalId: c.value.leadgen_id },
-            { $setOnInsert: { status: "pending", payload: c.value }, $set: { webhookAt: new Date(), ...(c.value.form_id ? { formId: c.value.form_id } : {}) } },
+            { externalId: leadgenId },
+            {
+              $setOnInsert: { status: "pending", payload: c.value },
+              $set: {
+                webhookAt: new Date(),
+                ...(c.value.form_id ? { formId: c.value.form_id } : {}),
+              },
+            },
             { upsert: true }
           );
+          try {
+            await ingestMetaLead(leadgenId);
+          } catch (err) {
+            console.error(`Meta webhook ingest failed for ${leadgenId}:`, err.message);
+          }
+        }
     s.sendStatus(200);
   })
 );
